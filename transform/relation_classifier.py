@@ -18,33 +18,34 @@ from schema.nodes import Action, TextUnit
 
 logger = logging.getLogger(__name__)
 
-# Nhãn tiếng Việt -> RelationType canonical. Nhãn chiều ngược (vd "được sửa đổi
-# bởi") được chuẩn hoá về đúng 1 chiều bằng cách đảo from/to khi xử lý, không
-# tạo enum riêng cho chiều ngược.
+# Nhãn tiếng Việt -> RelationType canonical. Nhãn chiều ngược (vd "được sửa đổi")
+# được chuẩn hoá về đúng 1 chiều bằng cách đảo from/to khi xử lý, không tạo enum
+# riêng cho chiều ngược. Bảng map đầy đủ 17 nhãn thực tế quan sát được trong
+# relationships.parquet (số dòng tính trên toàn corpus, để tham khảo độ phổ biến).
 RELATION_LABEL_MAP: dict[str, RelationType] = {
-    "Văn bản sửa đổi": RelationType.AMENDS,
-    "Văn bản bổ sung": RelationType.SUPPLEMENTS,
-    "Văn bản hết hiệu lực": RelationType.TERMINATES,
-    "Văn bản bị hết hiệu lực 1 phần": RelationType.PARTIALLY_TERMINATES,
-    "Văn bản đình chỉ": RelationType.SUSPENDS,
-    "Văn bản đình chỉ 1 phần": RelationType.PARTIALLY_SUSPENDS,
-    "Văn bản HD, QĐ chi tiết": RelationType.IMPLEMENTS,
-    "Văn bản dẫn chiếu": RelationType.REFERS_TO,
-    "Văn bản liên quan khác": RelationType.RELATED_TO,
-    "Văn bản căn cứ": RelationType.CITES,
+    "Văn bản căn cứ": RelationType.CITES,  # 582,352 dòng
+    "Văn bản dẫn chiếu": RelationType.REFERS_TO,  # 75,340 dòng
+    "Văn bản hết hiệu lực": RelationType.TERMINATES,  # 65,849 dòng
+    "Văn bản HD, QĐ chi tiết": RelationType.IMPLEMENTS,  # 34,418 dòng
+    "Văn bản bổ sung": RelationType.SUPPLEMENTS,  # 13,407 dòng
+    "Văn bản sửa đổi": RelationType.AMENDS,  # 7,490 dòng
+    "Văn bản quy định hết hiệu lực 1 phần": RelationType.PARTIALLY_TERMINATES,  # 6,285 dòng
+    "Văn bản liên quan khác": RelationType.RELATED_TO,  # 461 dòng — đối xứng
+    "Văn bản đình chỉ 1 phần": RelationType.PARTIALLY_SUSPENDS,  # 21 dòng
+    "Văn bản đình chỉ": RelationType.SUSPENDS,  # 16 dòng
 }
 
-# Nhãn chiều ngược -> RelationType canonical (đảo from/to)
+# Nhãn chiều ngược ("được"/"bị" — diễn đạt chiều bị động) -> RelationType
+# canonical, đảo from/to khi xử lý. CITES/REFERS_TO/RELATED_TO KHÔNG có nhãn
+# chiều ngược tương ứng trong 17 nhãn thực tế — không thêm entry suy đoán.
 REVERSE_RELATION_LABEL_MAP: dict[str, RelationType] = {
-    "Văn bản được sửa đổi": RelationType.AMENDS,
-    "Văn bản được bổ sung": RelationType.SUPPLEMENTS,
-    "Văn bản bị hết hiệu lực": RelationType.TERMINATES,
-    "Văn bản làm hết hiệu lực 1 phần": RelationType.PARTIALLY_TERMINATES,
-    "Văn bản bị đình chỉ": RelationType.SUSPENDS,
-    "Văn bản làm đình chỉ 1 phần": RelationType.PARTIALLY_SUSPENDS,
-    "Văn bản được HD, QĐ chi tiết": RelationType.IMPLEMENTS,
-    "Văn bản được dẫn chiếu": RelationType.REFERS_TO,
-    "Văn bản căn cứ bởi": RelationType.CITES,
+    "Văn bản quy định hết hiệu lực": RelationType.TERMINATES,  # 54,048 dòng
+    "Văn bản được HD, QĐ chi tiết": RelationType.IMPLEMENTS,  # 35,185 dòng
+    "Văn bản bị hết hiệu lực 1 phần": RelationType.PARTIALLY_TERMINATES,  # 8,692 dòng
+    "Văn bản được sửa đổi": RelationType.AMENDS,  # 7,737 dòng
+    "Văn bản được bổ sung": RelationType.SUPPLEMENTS,  # 6,556 dòng
+    "Văn bản bị đình chỉ 1 phần": RelationType.PARTIALLY_SUSPENDS,  # 19 dòng
+    "Văn bản bị đình chỉ": RelationType.SUSPENDS,  # 14 dòng
 }
 
 
