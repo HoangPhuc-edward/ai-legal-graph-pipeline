@@ -54,6 +54,27 @@ python run_pipeline.py --stage transform --sample 200 --no-llm
 Mỗi stage đọc/ghi qua file trung gian dưới `./data/` (`raw/`, `transformed/`, `embedded/`)
 để có thể dừng/chạy lại từng giai đoạn riêng — quan trọng vì `embed` tốn phí.
 
+### Tra cứu dữ liệu thô an toàn (`extract/hf_dataset.py`)
+
+Hai lệnh phụ trợ, đọc parquet **theo batch** (không bao giờ load full file —
+xem [`CLAUDE.md`](CLAUDE.md) Mục 1):
+
+```bash
+# Tìm content_html khớp 1 trong các từ khoá ở extract/keywords.txt
+# -> trả về content + metadata + relationships liên quan, ghi ra JSON
+python -m extract.hf_dataset keyword --limit 50      # giới hạn 50 văn bản khớp
+python -m extract.hf_dataset keyword                 # không limit -> quét full + lấy full quan hệ
+
+# Lấy mẫu an toàn để chạy thử pipeline: N metadata đầu (mặc định 100)
+# -> content tương ứng -> tối đa N relationships liên quan
+python -m extract.hf_dataset sample                   # N=100
+python -m extract.hf_dataset sample --n 20             # giảm xuống 20 nếu máy yếu
+```
+
+Kết quả ghi ra `data/samples/keyword_search.json` / `data/samples/sample.json`
+(tự tạo thư mục). Nếu `relationships.parquet` chưa có cục bộ, lệnh tự tải về
+`data/raw/` trước khi dùng.
+
 ## Test
 
 ```bash
