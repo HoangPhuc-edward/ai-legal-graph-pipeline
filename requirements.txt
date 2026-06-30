@@ -1,0 +1,9 @@
+pydantic>=2.0
+neo4j>=5.0
+huggingface_hub>=0.20
+pyarrow>=14.0
+fast-html2md
+python-dotenv>=1.0
+google-cloud-aiplatform>=1.38
+vertexai>=1.38
+pytest>=7.0
