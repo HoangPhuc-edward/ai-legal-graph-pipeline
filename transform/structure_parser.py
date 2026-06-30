@@ -35,6 +35,74 @@ _LEVEL_LABEL = {
     ComponentLevel.DIEM: "Điểm",
 }
 
+# Cùng các pattern Phần/Chương/Mục/Điều ở LEVEL_PATTERNS nhưng KHÔNG neo `^\s*`
+# — dùng để phát hiện marker bị "dính" giữa dòng (không phải đầu dòng) rồi cưỡng
+# chế tách thành dòng riêng ở normalize_legal_markdown(). CỐ TÌNH bỏ Khoản/Điểm:
+# pattern Khoản (`\d{1,2}\.`) quá lỏng, dễ khớp nhầm số liệu/ngày tháng giữa câu
+# (vd "2.000 - 3.000 đồng") — chỉ an toàn khi giới hạn trong phạm vi 1 Điều cụ
+# thể, để dành cho cải tiến sau (xem CLAUDE.md / README phần TODO).
+_FORCE_BREAK_PATTERNS: list[re.Pattern] = [
+    re.compile(r"Phần\s+(thứ\s+)?([IVXLCDM\d]+)", re.IGNORECASE),
+    re.compile(r"Chương\s+([IVXLCDM\d]+)", re.IGNORECASE),
+    re.compile(r"(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE),
+    re.compile(r"Điều\s+(\d+[a-zđ]?)\s*[\.\:]", re.IGNORECASE),
+]
+
+
+def _split_line_at_headers(line: str) -> list[str]:
+    """Tách 1 dòng thành nhiều dòng nếu có marker cấp (Phần/Chương/Mục/Điều) bị
+    dính giữa dòng — ví dụ '...hết hiệu lực.Chương II QUY ĐỊNH CHUNG' (HTML
+    nguồn không có <p> riêng cho từng marker) -> tách thành 2 dòng để
+    `_match_level` (chỉ match đầu dòng) bắt được."""
+    segments = [line]
+    changed = True
+    while changed:
+        changed = False
+        next_segments: list[str] = []
+        for seg in segments:
+            split_pos = None
+            for pattern in _FORCE_BREAK_PATTERNS:
+                m = pattern.search(seg)
+                if m and m.start() > 0:
+                    if split_pos is None or m.start() < split_pos:
+                        split_pos = m.start()
+            if split_pos:
+                next_segments.append(seg[:split_pos])
+                next_segments.append(seg[split_pos:])
+                changed = True
+            else:
+                next_segments.append(seg)
+        segments = next_segments
+    return [s for s in segments if s.strip()]
+
+
+def normalize_legal_markdown(markdown: str) -> str:
+    """Chuẩn hoá markdown TRƯỚC khi tách dòng, để marker cấp (Phần/Chương/Mục/
+    Điều) luôn nằm ở đầu dòng riêng — điều kiện bắt buộc để `_match_level` khớp
+    được (chỉ dùng `pattern.match()`, neo `^\\s*`).
+
+    2 lỗi phổ biến nhất khiến cả văn bản 0 Component (toàn bộ regex không khớp
+    dòng nào):
+      1. fast_html2md bọc marker trong markdown emphasis — '**Điều 1.** Phạm vi'
+         -> dòng bắt đầu bằng '**', không phải 'Điều'.
+      2. HTML nguồn không tách <p> riêng cho từng Phần/Chương/Điều — nhiều
+         marker bị dính chung 1 dòng/đoạn.
+    """
+    if not markdown:
+        return markdown
+
+    # Khoảng trắng lạ (NBSP, zero-width space) -> bình thường, không thì
+    # `\s*`/`.strip()` không nhận diện được là whitespace.
+    text = markdown.replace("\xa0", " ").replace("​", "")
+    # "**"/"__" chỉ là định dạng (bold), không mang nghĩa cấu trúc — bỏ thẳng
+    # luôn cho sạch (đỡ lẫn vào raw_text lưu trữ/embedding sau này).
+    text = text.replace("**", "").replace("__", "")
+
+    out_lines: list[str] = []
+    for raw_line in text.splitlines():
+        out_lines.extend(_split_line_at_headers(raw_line))
+    return "\n".join(out_lines)
+
 
 @dataclass
 class _StackEntry:
@@ -68,6 +136,31 @@ def _build_title_text(line: str, match: re.Match) -> Optional[str]:
     return remainder or None
 
 
+def _fallback_whole_document(norm_id: str, markdown: str, now: datetime) -> ParseResult:
+    """Văn bản KHÔNG khớp được level pattern nào kể cả sau normalize — vd sắc
+    lệnh bổ nhiệm nhân sự ngắn, văn phong cũ, không có cấu trúc Điều/Khoản rõ
+    ràng. Đây KHÔNG phải lỗi parser, văn bản vẫn hợp lệ — nhưng nếu để 0
+    Component thì 0 TextUnit, toàn bộ nội dung biến mất khỏi đồ thị. Gom toàn
+    văn vào đúng 1 pseudo-Component (level=DIEU, citation="Điều 1") để giữ lại
+    nội dung thay vì mất trắng."""
+    text = markdown.strip()
+    if not text:
+        return ParseResult()
+
+    comp_id = f"{norm_id}__c1"
+    component = Component(
+        comp_id=comp_id,
+        norm_id=norm_id,
+        level=ComponentLevel.DIEU,
+        citation="Điều 1",
+        order_index=1,
+        parent_comp_id=None,
+        title_text=None,
+        updated_at=now,
+    )
+    return ParseResult(components=[component], raw_text={comp_id: text + "\n"})
+
+
 def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     """Phân tích markdown của 1 văn bản thành cây Component.
 
@@ -75,6 +168,7 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     """
     now = datetime.now(timezone.utc)
     result = ParseResult()
+    markdown = normalize_legal_markdown(markdown)
 
     # stack[0] luôn là gốc ảo (Norm), rank = -1
     stack: list[_StackEntry] = [_StackEntry(comp_id="__ROOT__", level=None, rank=-1)]
@@ -133,5 +227,8 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     result.raw_text = {
         comp_id: text for comp_id, text in result.raw_text.items() if comp_id not in parent_ids
     }
+
+    if not result.components:
+        return _fallback_whole_document(norm_id, markdown, now)
 
     return result
