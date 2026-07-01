@@ -96,14 +96,12 @@ def check_neo4j() -> bool:
 
 def check_gemini_llm() -> bool:
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
+        from google import genai
         from config import GCP_LOCATION, GCP_PROJECT, LLM_MODEL_LIGHT
 
-        vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-        model = GenerativeModel(LLM_MODEL_LIGHT)
-        resp = model.generate_content("Reply with exactly: OK")
-        text = resp.text.strip()[:20]
+        client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
+        resp = client.models.generate_content(model=LLM_MODEL_LIGHT, contents="Reply with exactly: OK")
+        text = (resp.text or "").strip()[:20]
         _ok("Gemini LLM", f"{LLM_MODEL_LIGHT} → {text!r}")
         return True
     except Exception as exc:
@@ -113,14 +111,12 @@ def check_gemini_llm() -> bool:
 
 def check_gemini_embedding() -> bool:
     try:
-        import vertexai
-        from vertexai.language_models import TextEmbeddingModel
+        from google import genai
         from config import EMBEDDING_MODEL, GCP_LOCATION, GCP_PROJECT
 
-        vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-        model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL)
-        emb = model.get_embeddings(["kiểm tra kết nối"])
-        dim = len(emb[0].values)
+        client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
+        result = client.models.embed_content(model=EMBEDDING_MODEL, contents=["kiểm tra kết nối"])
+        dim = len(result.embeddings[0].values)
         _ok("Embedding", f"{EMBEDDING_MODEL}, dim={dim}")
         return True
     except Exception as exc:
@@ -165,7 +161,7 @@ def main() -> None:
         _skip("Gemini LLM")
         _skip("Embedding")
 
-    print(f"────────────────────────────────────────────────")
+    print("────────────────────────────────────────────────")
     print(f"✓ {passed}/{total} check passed — sẵn sàng chạy pipeline.\n")
 
 

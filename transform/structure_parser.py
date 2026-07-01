@@ -17,10 +17,13 @@ from schema.nodes import Component
 # Thứ tự ưu tiên CỐ ĐỊNH — kiểm tra Phần trước, rồi Chương, Mục, Điều, Khoản, Điểm
 # (pattern hẹp hơn như "Điều" có thể match nhầm bên trong dòng "Chương").
 LEVEL_PATTERNS: list[tuple[ComponentLevel, re.Pattern]] = [
-    (ComponentLevel.PHAN, re.compile(r"^\s*Phần\s+(thứ\s+)?([IVXLCDM\d]+)", re.IGNORECASE)),
-    (ComponentLevel.CHUONG, re.compile(r"^\s*Chương\s+([IVXLCDM\d]+)", re.IGNORECASE)),
+    (ComponentLevel.PHAN, re.compile(r"^\s*Phần\s+(thứ\s+)?([IVXLCDM\d]+)\b", re.IGNORECASE)),
+    (ComponentLevel.CHUONG, re.compile(r"^\s*Chương\s+([IVXLCDM\d]+)\b", re.IGNORECASE)),
     (ComponentLevel.MUC, re.compile(r"^\s*(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE)),
-    (ComponentLevel.DIEU, re.compile(r"^\s*Điều\s+(\d+[a-zđ]?)\s*[\.\:]", re.IGNORECASE)),
+    # Không dùng re.IGNORECASE — [a-zđ] phải chỉ match lowercase để tránh nuốt
+    # chữ hoa đầu của content vào số Điều (vd "Điều 2Công dân" → Điều 2C nếu IGNORECASE).
+    # Match cả "Điều" và "điều" bằng [Đđ]iều thay vì IGNORECASE toàn pattern.
+    (ComponentLevel.DIEU, re.compile(r"^\s*[Đđ]iều\s+(\d+[a-zđ]?)\s*[\.\:]?")),
     (ComponentLevel.KHOAN, re.compile(r"^\s*(\d{1,2})\.\s+")),
     (ComponentLevel.DIEM, re.compile(r"^\s*([a-zđ])\)\s+")),
 ]
@@ -42,33 +45,74 @@ _LEVEL_LABEL = {
 # (vd "2.000 - 3.000 đồng") — chỉ an toàn khi giới hạn trong phạm vi 1 Điều cụ
 # thể, để dành cho cải tiến sau (xem CLAUDE.md / README phần TODO).
 _FORCE_BREAK_PATTERNS: list[re.Pattern] = [
-    re.compile(r"Phần\s+(thứ\s+)?([IVXLCDM\d]+)", re.IGNORECASE),
-    re.compile(r"Chương\s+([IVXLCDM\d]+)", re.IGNORECASE),
+    re.compile(r"Phần\s+(thứ\s+)?([IVXLCDM\d]+)\b", re.IGNORECASE),
+    re.compile(r"Chương\s+([IVXLCDM\d]+)\b", re.IGNORECASE),
     re.compile(r"(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE),
+    # Có dấu chấm/hai chấm sau số — an toàn kể cả nội dung câu ("tại Điều 5.")
     re.compile(r"Điều\s+(\d+[a-zđ]?)\s*[\.\:]", re.IGNORECASE),
+    # Văn bản cũ KHÔNG có dấu câu sau số Điều — chỉ split khi ký tự TRƯỚC Điều
+    # là non-space (CHUNGĐiều, kín.Điều) để tránh false positive "tại Điều 5 của
+    # Luật" (có space trước Điều → lookbehind không khớp).
+    re.compile(r"(?<=\S)Điều\s+(\d+[a-zđ]?)\s*[\.\:]?", re.IGNORECASE),
 ]
+
+# Dùng để phát hiện trailing content là Khoản/Điểm — quyết định có tách sau marker không
+_KHOAN_AT_START = re.compile(r"^\s*\d{1,2}\.\s+")
+_DIEM_AT_START = re.compile(r"^\s*[a-zđ]\)\s+")
 
 
 def _split_line_at_headers(line: str) -> list[str]:
     """Tách 1 dòng thành nhiều dòng nếu có marker cấp (Phần/Chương/Mục/Điều) bị
     dính giữa dòng — ví dụ '...hết hiệu lực.Chương II QUY ĐỊNH CHUNG' (HTML
     nguồn không có <p> riêng cho từng marker) -> tách thành 2 dòng để
-    `_match_level` (chỉ match đầu dòng) bắt được."""
+    `_match_level` (chỉ match đầu dòng) bắt được.
+
+    Xử lý 2 case:
+      A) marker bị dính SAU nội dung (m.start() > 0): tách TRƯỚC marker.
+         Vòng lặp tiếp theo sẽ xử lý segment mới bắt đầu bằng marker (case B).
+      B) marker ở ĐẦU đoạn nhưng nội dung phía sau là Khoản/Điểm (m.start() == 0,
+         trailing matches Khoản/Điểm pattern): tách SAU marker — để Khoản/Điểm
+         không bị "nuốt" vào title_text của Điều và biến mất khi Điều trở thành cha.
+         Ví dụ: 'Điều 2. 1. Thu ngân sách...' -> ['Điều 2.', '1. Thu ngân sách...']
+         KHÔNG tách: 'Điều 1. Phạm vi điều chỉnh' (trailing không phải Khoản/Điểm).
+    """
     segments = [line]
     changed = True
     while changed:
         changed = False
         next_segments: list[str] = []
         for seg in segments:
-            split_pos = None
+            split_before = None  # case A: tách trước marker
+            split_after = None   # case B: tách sau marker (khi marker ở đầu)
             for pattern in _FORCE_BREAK_PATTERNS:
                 m = pattern.search(seg)
-                if m and m.start() > 0:
-                    if split_pos is None or m.start() < split_pos:
-                        split_pos = m.start()
-            if split_pos:
-                next_segments.append(seg[:split_pos])
-                next_segments.append(seg[split_pos:])
+                if not m:
+                    continue
+                if m.start() > 0:
+                    if split_before is None or m.start() < split_before:
+                        split_before = m.start()
+                else:
+                    # pos-0 match: kiểm tra trailing có cần split_after không
+                    if split_before is None and split_after is None:
+                        trailing = seg[m.end():]
+                        # Chỉ tách khi trailing bắt đầu bằng Khoản (`\d.`) hoặc Điểm (`a)`)
+                        # — tránh tách "Điều 1. Phạm vi điều chỉnh" (trailing là title_text hợp lệ)
+                        if _KHOAN_AT_START.match(trailing) or _DIEM_AT_START.match(trailing):
+                            split_after = m.end()
+                    # Tiếp tục search từ sau match đầu để tìm marker cùng loại bị dính
+                    # giữa dòng — pattern.search() chỉ trả về match ĐẦU TIÊN, nếu match
+                    # đầu ở pos 0 (Điều 1.) thì Điều 2. phía sau sẽ bị bỏ qua hoàn toàn
+                    # nếu không search lại từ m.end().
+                    m2 = pattern.search(seg, m.end())
+                    if m2 and (split_before is None or m2.start() < split_before):
+                        split_before = m2.start()
+            if split_before is not None:
+                next_segments.append(seg[:split_before])
+                next_segments.append(seg[split_before:])
+                changed = True
+            elif split_after is not None:
+                next_segments.append(seg[:split_after])
+                next_segments.append(seg[split_after:])
                 changed = True
             else:
                 next_segments.append(seg)
@@ -94,9 +138,20 @@ def normalize_legal_markdown(markdown: str) -> str:
     # Khoảng trắng lạ (NBSP, zero-width space) -> bình thường, không thì
     # `\s*`/`.strip()` không nhận diện được là whitespace.
     text = markdown.replace("\xa0", " ").replace("​", "")
-    # "**"/"__" chỉ là định dạng (bold), không mang nghĩa cấu trúc — bỏ thẳng
-    # luôn cho sạch (đỡ lẫn vào raw_text lưu trữ/embedding sau này).
-    text = text.replace("**", "").replace("__", "")
+    # Bước 1: Chuyển **Điều X** → \nĐiều X TRƯỚC khi xóa ** — để marker nằm đầu
+    # dòng riêng thay vì bị "nuốt" vào raw_text của Chương cha. Văn bản cũ (Luật,
+    # Sắc lệnh trước 2000) bọc mỗi Điều trong bold: "**Điều 1**Nội dung..." — sau
+    # khi xóa ** thành space chỉ còn " Điều 1 Nội dung" không tách được.
+    text = re.sub(
+        r"\*+\s*(Điều\s+\d+[a-zđ]?\s*\.?)\s*\*+",
+        r"\n\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Bước 2: "**"/"__" còn lại chỉ là định dạng, thay bằng khoảng trắng (không
+    # phải "") để tránh dán liền từ: "**Điều 49**1." → "Điều 49 1." thay vì "Điều 491."
+    text = text.replace("**", " ").replace("__", " ")
+    text = re.sub(r" {2,}", " ", text)
 
     out_lines: list[str] = []
     for raw_line in text.splitlines():

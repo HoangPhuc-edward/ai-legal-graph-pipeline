@@ -87,13 +87,10 @@ def _extract_with_regex(text: str) -> Optional[str]:
 def _extract_with_llm(text: str, model_name: str, other_doc_id: str) -> Optional[str]:
     """Gọi Vertex AI Gemini để trích citation_path của Component B. Trả None nếu mơ hồ/lỗi."""
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
-
+        from google import genai
         from config import GCP_LOCATION, GCP_PROJECT
 
-        vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-        model = GenerativeModel(model_name)
+        client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
         prompt = (
             "Trích vị trí (Điều/Khoản/Điểm) bị thay đổi từ đoạn văn bản pháp luật sau, "
             f"thuộc văn bản đích có id '{other_doc_id}'. Trả lời đúng định dạng:\n"
@@ -101,7 +98,7 @@ def _extract_with_llm(text: str, model_name: str, other_doc_id: str) -> Optional
             "Nếu không xác định được, trả lời UNKNOWN.\n\n"
             f"Đoạn văn:\n{text}"
         )
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=model_name, contents=prompt)
         content = (response.text or "").strip()
         if "UNKNOWN" in content.upper():
             return None

@@ -16,4 +16,7 @@ def convert(content_html: str) -> str:
     """Chuyển content_html sang markdown sạch."""
     if not content_html:
         return ""
-    return _converter.convert(content_html)
+    try:
+        return _converter.convert(content_html)
+    except Exception:
+        return ""
