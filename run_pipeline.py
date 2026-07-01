@@ -51,7 +51,7 @@ def stage_extract() -> None:
     hf_dataset.download_all()
 
 
-def stage_transform(sample: int | None, use_llm: bool) -> None:
+def stage_transform(sample: int | None, use_llm: bool, workers: int = 1) -> None:
     from extract import hf_dataset
     from transform import pipeline as transform_pipeline
 
@@ -63,6 +63,7 @@ def stage_transform(sample: int | None, use_llm: bool) -> None:
         sample=sample,
         use_llm=use_llm,
         output_dir=TRANSFORMED_DIR,
+        workers=workers,
     )
 
 
@@ -78,10 +79,7 @@ def stage_embed() -> None:
     logger.info("Embed xong %d TextUnit -> %s", len(text_units), EMBEDDED_DIR / "textunits.jsonl")
 
 
-def stage_load() -> None:
-    from load import loaders
-    from load.neo4j_client import Neo4jClient
-
+def _read_load_artifacts():
     norms = _read_jsonl(TRANSFORMED_DIR / "norms.jsonl", Norm)
     components = _read_jsonl(TRANSFORMED_DIR / "components.jsonl", Component)
     actions = _read_jsonl(TRANSFORMED_DIR / "actions.jsonl", Action)
@@ -102,14 +100,42 @@ def stage_load() -> None:
         with open(action_links_path, "r", encoding="utf-8") as f:
             action_links = [json.loads(line) for line in f if line.strip()]
 
+    return norms, components, actions, relations, component_text_units, cache_text_units, component_textunit_map, action_links, text_units
+
+
+def stage_load(limit_aura: bool = False) -> None:
+    from load import loaders
+    from load.neo4j_client import Neo4jClient
+
+    (
+        norms, components, actions, relations,
+        component_text_units, cache_text_units,
+        component_textunit_map, action_links, text_units,
+    ) = _read_load_artifacts()
+
+    schema_path = Path(__file__).parent / "load" / "schema_init.cypher"
+
     with Neo4jClient() as client:
-        client.run_schema_init(Path(__file__).parent / "load" / "schema_init.cypher")
-        loaders.load_norms(client, norms)
-        loaders.load_components(client, components)
-        loaders.load_component_textunits(client, component_text_units, component_textunit_map)
-        loaders.load_actions(client, actions)
-        loaders.load_action_edges(client, action_links, cache_text_units)
-        loaders.load_relations(client, relations)
+        client.run_schema_init(schema_path)
+        if limit_aura:
+            loaders.load_with_limit(
+                client=client,
+                norms=norms,
+                components=components,
+                component_text_units=component_text_units,
+                component_textunit_map=component_textunit_map,
+                actions=actions,
+                action_links=action_links,
+                cache_text_units=cache_text_units,
+                relations=relations,
+            )
+        else:
+            loaders.load_norms(client, norms)
+            loaders.load_components(client, components)
+            loaders.load_component_textunits(client, component_text_units, component_textunit_map)
+            loaders.load_actions(client, actions)
+            loaders.load_action_edges(client, action_links, cache_text_units)
+            loaders.load_relations(client, relations)
 
     logger.info(
         "Load xong: %d Norm, %d Component, %d TextUnit (%d cache), %d Action, %d NormRelation",
@@ -135,6 +161,17 @@ def main() -> None:
         action="store_true",
         help="Tắt LLM fallback ở action_extractor (chỉ dùng regex Tầng B)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Số process song song cho Pass 1 transform (mặc định 1 — an toàn cho laptop; Colab dùng 4)",
+    )
+    parser.add_argument(
+        "--limit-aura",
+        action="store_true",
+        help="Giới hạn load không vượt 200k node / 400k edge (AuraDB Free)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -144,11 +181,11 @@ def main() -> None:
     if args.stage in ("extract", "all"):
         stage_extract()
     if args.stage in ("transform", "all"):
-        stage_transform(sample=args.sample, use_llm=use_llm)
+        stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers)
     if args.stage in ("embed", "all"):
         stage_embed()
     if args.stage in ("load", "all"):
-        stage_load()
+        stage_load(limit_aura=args.limit_aura)
 
 
 if __name__ == "__main__":

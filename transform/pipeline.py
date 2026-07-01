@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,6 +183,25 @@ def transform_relationships(
     return relations, actions
 
 
+def _transform_batch(pairs: list[tuple[dict, str]]) -> list[TransformedDoc]:
+    """Worker Pass 1 — xử lý 1 batch (row, content_html) độc lập trong subprocess.
+
+    Hàm này ở cấp MODULE (không lồng trong hàm khác) vì ProcessPoolExecutor yêu
+    cầu có thể pickle được để gửi qua boundary giữa các process (đặc biệt trên
+    Windows, dùng spawn context). Mỗi subprocess import lại module hoàn chỉnh
+    nên không cần truyền state nào qua argument ngoài data.
+    """
+    results = []
+    for row, content_html in pairs:
+        norm_id = str(row["id"])
+        try:
+            doc = transform_one(row, content_html)
+            results.append(doc)
+        except Exception as exc:
+            logger.exception("Lỗi transform văn bản %s: %s", norm_id, exc)
+    return results
+
+
 def _write_jsonl(path: Path, items: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -196,8 +216,16 @@ def run(
     sample: Optional[int] = None,
     use_llm: bool = True,
     output_dir: Path = TRANSFORMED_DIR,
+    workers: int = 1,
 ) -> None:
-    """Orchestrate toàn bộ transform stage (2 pass), ghi kết quả ra JSON Lines."""
+    """Orchestrate toàn bộ transform stage (2 pass), ghi kết quả ra JSON Lines.
+
+    workers=1 (mặc định, an toàn cho laptop 8GB): sequential, không spawn process.
+    workers>1 (gợi ý Colab: 4): Pass 1 chạy parallel bằng ProcessPoolExecutor —
+      mỗi worker xử lý 1 chunk văn bản độc lập, main process merge kết quả và
+      build component_index sau khi TẤT CẢ worker xong (không parallel được vì
+      cần toàn bộ Component trước khi index hoàn chỉnh).
+    """
     metadata_rows = metadata_table.to_pylist()
     if sample is not None:
         metadata_rows = metadata_rows[:sample]
@@ -207,16 +235,31 @@ def run(
     # ═══════════ PASS 1 — structure parsing toàn corpus + build component_index ═══════════
     docs_by_norm_id: dict[str, TransformedDoc] = {}
     component_index: dict[tuple[str, str], str] = {}
-    for row in metadata_rows:
-        norm_id = str(row["id"])
-        content_html = content_by_id.get(row["id"]) or content_by_id.get(str(row["id"])) or ""
-        try:
-            doc = transform_one(row, content_html)
-        except Exception:
-            logger.exception("Lỗi transform văn bản %s, bỏ qua.", norm_id)
-            continue
-        docs_by_norm_id[norm_id] = doc
-        component_index.update(_build_component_index_entries(norm_id, doc.components))
+
+    pairs = [
+        (row, content_by_id.get(row["id"]) or content_by_id.get(str(row["id"])) or "")
+        for row in metadata_rows
+    ]
+
+    if workers <= 1:
+        all_docs = _transform_batch(pairs)
+    else:
+        chunk_size = max(1, len(pairs) // workers)
+        chunks = [pairs[i : i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+        logger.info("Pass 1 — %d văn bản / %d worker / chunk ~%d", len(pairs), len(chunks), chunk_size)
+        all_docs = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_transform_batch, chunk): i for i, chunk in enumerate(chunks)}
+            for future in as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    all_docs.extend(future.result())
+                except Exception:
+                    logger.exception("Worker chunk %d lỗi, bỏ qua.", chunk_idx)
+
+    for doc in all_docs:
+        docs_by_norm_id[doc.norm.norm_id] = doc
+        component_index.update(_build_component_index_entries(doc.norm.norm_id, doc.components))
 
     # ═══════════ PASS 2 — action extraction xuyên văn bản, dùng component_index ═══════════
     relations, actions = transform_relationships(

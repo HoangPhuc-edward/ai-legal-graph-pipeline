@@ -36,6 +36,14 @@ class Neo4jClient:
                 session.run(statement)
         logger.info("Đã chạy schema_init.cypher (%d statement)", len(statements))
 
+    def count_nodes(self) -> int:
+        with self._driver.session() as session:
+            return session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+
+    def count_edges(self) -> int:
+        with self._driver.session() as session:
+            return session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+
     def batch_write(self, cypher: str, rows: list[dict], batch_size: int = NEO4J_BATCH_SIZE) -> None:
         """Chạy `UNWIND $rows AS row ...` theo từng batch — pattern dùng chung
         cho mọi hàm load_* trong loaders.py, tránh viết lại boilerplate."""

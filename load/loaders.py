@@ -1,5 +1,5 @@
 """load_norms / load_components / load_component_textunits / load_actions /
-load_action_edges / load_relations.
+load_action_edges / load_relations + load_with_limit (guard ngưỡng AuraDB Free).
 
 Thứ tự load BẮT BUỘC (phụ thuộc node đã tồn tại từ bước trước):
   1. load_norms()
@@ -20,10 +20,14 @@ việc tạo cạnh HAS_ACTION/APPLY_TO — cùng 1 transaction logic.
 """
 from __future__ import annotations
 
+import logging
+
 from schema.edges import NormRelation
 from schema.nodes import Action, Component, Norm, TextUnit
 
 from .neo4j_client import Neo4jClient
+
+logger = logging.getLogger(__name__)
 
 
 def load_norms(client: Neo4jClient, norms: list[Norm]) -> None:
@@ -172,6 +176,112 @@ def load_action_edges(
     SET tu.accumulated_text = row.cache_text, tu.type = 'cache_action', tu.embedding = null
     """
     client.batch_write(cypher, rows)
+
+
+class _LimitReached(Exception):
+    """Internal sentinel — dừng load khi sẽ vượt ngưỡng AuraDB Free."""
+
+
+def _trim_to_node_budget(
+    items: list,
+    item_count_fn,
+    client: Neo4jClient,
+    max_nodes: int,
+    label: str,
+) -> list:
+    """Cắt `items` sao cho tổng node hiện có + số node mới không vượt max_nodes.
+
+    item_count_fn(items) -> int: số node mới sẽ tạo từ items này (có thể khác
+    len(items) vì 1 load step có thể sinh edge lẫn node).
+    """
+    current = client.count_nodes()
+    budget = max_nodes - current
+    new_count = item_count_fn(items)
+    if new_count <= budget:
+        return items
+    if budget <= 0:
+        logger.warning("[--limit-aura] %s: đã đạt ngưỡng %d node — bỏ qua toàn bộ.", label, max_nodes)
+        return []
+    cut = min(budget, len(items))
+    logger.warning(
+        "[--limit-aura] %s: chỉ load %d/%d item (còn budget %d node, ngưỡng %d).",
+        label, cut, len(items), budget, max_nodes,
+    )
+    return items[:cut]
+
+
+def _trim_to_edge_budget(
+    items: list,
+    edges_per_item: int,
+    client: Neo4jClient,
+    max_edges: int,
+    label: str,
+) -> list:
+    current = client.count_edges()
+    budget = max_edges - current
+    if budget <= 0:
+        logger.warning("[--limit-aura] %s: đã đạt ngưỡng %d edge — bỏ qua toàn bộ.", label, max_edges)
+        return []
+    cut = min(len(items), budget // max(edges_per_item, 1))
+    if cut < len(items):
+        logger.warning(
+            "[--limit-aura] %s: chỉ load %d/%d item (còn budget %d edge, ngưỡng %d).",
+            label, cut, len(items), budget, max_edges,
+        )
+    return items[:cut]
+
+
+def load_with_limit(
+    client: Neo4jClient,
+    norms: list[Norm],
+    components: list[Component],
+    component_text_units: list[TextUnit],
+    component_textunit_map: dict[str, str],
+    actions: list[Action],
+    action_links: list[dict],
+    cache_text_units: dict[str, TextUnit],
+    relations: list[NormRelation],
+    max_nodes: int = 200_000,
+    max_edges: int = 400_000,
+) -> None:
+    """Wrapper quanh các hàm load_* với guard AuraDB Free.
+
+    Trước MỖI bước load, đếm node/edge hiện có trong Neo4j rồi cắt batch nếu
+    sẽ vượt ngưỡng. Dừng sạch (log warning, không crash) thay vì âm thầm bỏ qua
+    hay raise exception không rõ ràng.
+
+    Ưu tiên thứ tự: Norm → Component → TextUnit → Action → Edge (giữ nguyên
+    dependency hiện tại để tránh orphan edge).
+    """
+    norms_cut = _trim_to_node_budget(norms, len, client, max_nodes, "Norm")
+    load_norms(client, norms_cut)
+
+    components_cut = _trim_to_node_budget(components, len, client, max_nodes, "Component")
+    load_components(client, components_cut)
+
+    # TextUnit noi_dung: 1 node + 1 edge (HAS_TEXTUNIT) mỗi item — guard node trước
+    tu_cut = _trim_to_node_budget(component_text_units, len, client, max_nodes, "TextUnit(noi_dung)")
+    tu_cut = _trim_to_edge_budget(tu_cut, 1, client, max_edges, "HAS_TEXTUNIT(Component)")
+    if tu_cut:
+        load_component_textunits(client, tu_cut, component_textunit_map)
+
+    actions_cut = _trim_to_node_budget(actions, len, client, max_nodes, "Action")
+    load_actions(client, actions_cut)
+
+    # action_links: 1 node TextUnit cache + 3 edge (HAS_ACTION, APPLY_TO, HAS_TEXTUNIT) mỗi link
+    links_cut = _trim_to_node_budget(action_links, len, client, max_nodes, "TextUnit(cache_action)")
+    links_cut = _trim_to_edge_budget(links_cut, 3, client, max_edges, "HAS_ACTION+APPLY_TO+HAS_TEXTUNIT")
+    if links_cut:
+        load_action_edges(client, links_cut, cache_text_units)
+
+    # NormRelation: chỉ edge (Norm đã có sẵn từ bước Norm trên)
+    relations_cut = _trim_to_edge_budget(relations, 1, client, max_edges, "NormRelation")
+    if relations_cut:
+        load_relations(client, relations_cut)
+
+    final_nodes = client.count_nodes()
+    final_edges = client.count_edges()
+    logger.info("[--limit-aura] Load xong: %d node, %d edge (ngưỡng %d/%d)", final_nodes, final_edges, max_nodes, max_edges)
 
 
 def load_relations(client: Neo4jClient, relations: list[NormRelation]) -> None:
