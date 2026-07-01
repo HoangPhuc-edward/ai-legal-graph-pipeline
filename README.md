@@ -41,14 +41,27 @@ cp .env.example .env            # điền NEO4J_URI / NEO4J_PASSWORD / GCP_PROJE
 ## Chạy pipeline
 
 ```bash
-python run_pipeline.py --stage extract
-python run_pipeline.py --stage transform --sample 200      # test trước khi full
-python run_pipeline.py --stage embed
-python run_pipeline.py --stage load
-python run_pipeline.py --stage all
+# Kiểm tra môi trường trước khi chạy (khuyến nghị):
+python tools/health_check.py             # kiểm tra 5 điểm: lib, data files, Neo4j, LLM, Embedding
+python tools/health_check.py --skip-llm  # bỏ qua check LLM + Embedding (nhanh hơn)
 
-# Tắt LLM fallback ở action_extractor (chỉ dùng regex Tầng B):
-python run_pipeline.py --stage transform --sample 200 --no-llm
+# Các stage ETL:
+python run_pipeline.py --stage extract                              # tải parquet về data/raw/
+python run_pipeline.py --stage transform --sample 200              # test trước khi full
+python run_pipeline.py --stage transform --sample 200 --no-llm     # chỉ dùng regex, không gọi LLM
+python run_pipeline.py --stage transform --sample 200 --workers 4  # song song Pass 1 (Colab)
+python run_pipeline.py --stage embed                               # vector hoá TextUnit (tốn phí)
+python run_pipeline.py --stage load                                # nạp vào Neo4j
+python run_pipeline.py --stage load --limit-aura                   # giới hạn 200k node / 400k edge
+python run_pipeline.py --stage all                                 # chạy toàn bộ
+
+# Ước tính kích thước đồ thị trước khi load:
+python tools/estimate_graph_size.py             # đọc data/transformed/*.jsonl
+python tools/estimate_graph_size.py --dir PATH  # thư mục transformed tuỳ chọn
+
+# Xoá sạch Neo4j (có xác nhận):
+python tools/clean_neo4j.py          # hỏi "yes" trước khi xoá
+python tools/clean_neo4j.py --force  # xoá không hỏi
 ```
 
 Mỗi stage đọc/ghi qua file trung gian dưới `./data/` (`raw/`, `transformed/`, `embedded/`)
@@ -56,24 +69,30 @@ Mỗi stage đọc/ghi qua file trung gian dưới `./data/` (`raw/`, `transform
 
 ### Tra cứu dữ liệu thô an toàn (`extract/hf_dataset.py`)
 
-Hai lệnh phụ trợ, đọc parquet **theo batch** (không bao giờ load full file —
-xem [`CLAUDE.md`](CLAUDE.md) Mục 1):
+Đọc parquet **theo batch** (không bao giờ load full file — xem [`CLAUDE.md`](CLAUDE.md) Mục 1).
+Chạy lại nhiều lần **không bị duplicate** — file JSON ghi đè, Neo4j dùng `MERGE`.
 
 ```bash
-# Tìm content_html khớp 1 trong các từ khoá ở extract/keywords.txt
-# -> trả về content + metadata + relationships liên quan, ghi ra JSON
-python -m extract.hf_dataset keyword --limit 50      # giới hạn 50 văn bản khớp
-python -m extract.hf_dataset keyword                 # không limit -> quét full + lấy full quan hệ
-
 # Lấy mẫu an toàn để chạy thử pipeline: N metadata đầu (mặc định 100)
 # -> content tương ứng -> tối đa N relationships liên quan
-python -m extract.hf_dataset sample                   # N=100
-python -m extract.hf_dataset sample --n 20             # giảm xuống 20 nếu máy yếu
+python -m extract.hf_dataset sample           # N=100, ghi ra data/samples/sample.json
+python -m extract.hf_dataset sample --n 20   # giảm xuống 20 nếu máy yếu
+
+# Tìm content_html khớp từ khoá trong extract/keywords.txt
+# -> content + metadata + relationships liên quan, ghi ra JSON
+python -m extract.hf_dataset keyword                  # quét full, lấy tất cả kết quả
+python -m extract.hf_dataset keyword --limit 50       # giới hạn 50 văn bản khớp
+python -m extract.hf_dataset keyword --keywords-file PATH --output PATH  # tuỳ chỉnh file
+
+# Tải parquet (dành cho Colab / lưu vào Google Drive):
+python -m extract.hf_dataset download                               # tải cả 3, bỏ qua file đã có
+python -m extract.hf_dataset download --output-dir /content/drive/MyDrive/legal/raw
+python -m extract.hf_dataset download --configs metadata relationships  # chỉ 2 config
+python -m extract.hf_dataset download --force                       # tải lại dù đã có sẵn
 ```
 
-Kết quả ghi ra `data/samples/keyword_search.json` / `data/samples/sample.json`
-(tự tạo thư mục). Nếu `relationships.parquet` chưa có cục bộ, lệnh tự tải về
-`data/raw/` trước khi dùng.
+Kết quả ghi ra `data/samples/sample.json` / `data/samples/keyword_search.json`
+(tự tạo thư mục). Nếu parquet chưa có cục bộ, lệnh tự tải về `data/raw/` trước khi dùng.
 
 ## Test
 

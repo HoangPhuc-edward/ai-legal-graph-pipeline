@@ -6,7 +6,11 @@ Thay vào đó tải trực tiếp file .parquet qua nhánh `refs/convert/parque
 bằng `huggingface_hub` + đọc bằng `pyarrow.parquet`.
 
 CLI:
-    python -m extract.hf_dataset extract                          # tải full 3 config
+    python -m extract.hf_dataset extract                          # tải full 3 config về RAW_DIR
+    python -m extract.hf_dataset download                         # như extract nhưng linh hoạt hơn (dành cho Colab)
+    python -m extract.hf_dataset download --output-dir /content/drive/MyDrive/legal/raw
+    python -m extract.hf_dataset download --configs metadata relationships   # chỉ tải 2 config
+    python -m extract.hf_dataset download --force                            # tải lại dù đã có
     python -m extract.hf_dataset keyword [--keywords-file F] [--limit N] [--output F]
     python -m extract.hf_dataset sample [--n N] [--output F]
 
@@ -68,21 +72,41 @@ def _download_config_table(config: str) -> pa.Table:
     return pa.concat_tables(tables, promote_options="permissive")
 
 
+def download_configs(
+    configs: list[str] | None = None,
+    output_dir: Path = RAW_DIR,
+    force: bool = False,
+) -> dict[str, Path]:
+    """Tải 1 hoặc nhiều config từ HF Hub, ghi ra parquet cục bộ.
+
+    configs=None -> tải cả 3 (metadata/content/relationships).
+    force=False  -> bỏ qua config đã có file cục bộ (an toàn cho Colab: không
+                    tải lại file lớn nếu lỡ re-run cell).
+    Trả về dict {config_name: local_path} chỉ gồm những config đã tải/có sẵn.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    targets = list(configs) if configs else list(CONFIGS)
+    result: dict[str, Path] = {}
+    for config in targets:
+        out_path = output_dir / f"{config}.parquet"
+        if out_path.exists() and not force:
+            logger.info("Đã có %s (%d dòng) — bỏ qua (dùng --force để tải lại).", out_path, pq.ParquetFile(out_path).metadata.num_rows)
+            result[config] = out_path
+            continue
+        logger.info("Đang tải config '%s' từ %s ...", config, HF_DATASET_REPO)
+        table = _download_config_table(config)
+        pq.write_table(table, out_path)
+        logger.info("Đã ghi %s (%d dòng) -> %s", config, table.num_rows, out_path)
+        result[config] = out_path
+    return result
+
+
 def download_all(output_dir: Path = RAW_DIR) -> dict[str, Path]:
     """Tải 3 config (metadata/content/relationships), ghi ra parquet cục bộ.
 
     Trả về dict {config_name: local_path}.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result: dict[str, Path] = {}
-    for config in CONFIGS:
-        logger.info("Đang tải config '%s' từ %s ...", config, HF_DATASET_REPO)
-        table = _download_config_table(config)
-        out_path = output_dir / f"{config}.parquet"
-        pq.write_table(table, out_path)
-        logger.info("Đã ghi %s (%d dòng) -> %s", config, table.num_rows, out_path)
-        result[config] = out_path
-    return result
+    return download_configs(output_dir=output_dir, force=True)
 
 
 def load_local(output_dir: Path = RAW_DIR) -> dict[str, pa.Table]:
@@ -273,7 +297,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="extract.hf_dataset CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("extract", help="Tải full 3 config (metadata/content/relationships) về data/raw/")
+    sub.add_parser("extract", help="Tải full 3 config (metadata/content/relationships) về data/raw/ (bỏ qua --output-dir)")
+
+    p_download = sub.add_parser(
+        "download",
+        help="Tải parquet về thư mục tuỳ chọn — dành cho Colab (Google Drive) hoặc máy ngoài",
+    )
+    p_download.add_argument(
+        "--output-dir",
+        type=Path,
+        default=RAW_DIR,
+        help="Thư mục đích (mặc định: data/raw/). Colab: /content/drive/MyDrive/legal/raw",
+    )
+    p_download.add_argument(
+        "--configs",
+        nargs="+",
+        choices=list(CONFIGS),
+        default=None,
+        metavar="CONFIG",
+        help="Config cần tải (metadata/content/relationships). Mặc định: tải cả 3.",
+    )
+    p_download.add_argument(
+        "--force",
+        action="store_true",
+        help="Tải lại dù file đã tồn tại cục bộ.",
+    )
 
     p_keyword = sub.add_parser(
         "keyword",
@@ -299,6 +347,16 @@ def main() -> None:
 
     if args.command == "extract":
         download_all()
+    elif args.command == "download":
+        paths = download_configs(
+            configs=args.configs,
+            output_dir=args.output_dir,
+            force=args.force,
+        )
+        print(f"\nĐã có {len(paths)} file:")
+        for cfg, p in paths.items():
+            rows = pq.ParquetFile(p).metadata.num_rows
+            print(f"  {cfg:20s} {rows:>10,} dòng  ->  {p}")
     elif args.command == "keyword":
         result = search_by_keywords(keywords_path=args.keywords_file, limit=args.limit)
         _write_result(result, args.output)
