@@ -30,12 +30,14 @@ class RelationType(str, Enum):
     CITES = "CITES"  # căn cứ
 
 
-# Chỉ 6/10 loại có khái niệm "nội dung thay đổi cụ thể" — đáng chạy action_extractor.
+# 4/10 loại có khái niệm "nội dung thay đổi ở cấp Điều/Khoản/Điểm cụ thể".
+# TERMINATES/SUSPENDS bị loại: chúng terminate/suspend cả văn bản, không có
+# citation Điều/Khoản → LLM call lãng phí, luôn trả UNKNOWN.
+# PARTIALLY_TERMINATES/PARTIALLY_SUSPENDS giữ lại vì "1 phần" có thể chỉ
+# hết hiệu lực/đình chỉ những Điều/Khoản cụ thể.
 ELIGIBLE_FOR_LAYER_B = {
     RelationType.AMENDS,
     RelationType.SUPPLEMENTS,
-    RelationType.TERMINATES,
     RelationType.PARTIALLY_TERMINATES,
-    RelationType.SUSPENDS,
     RelationType.PARTIALLY_SUSPENDS,
 }

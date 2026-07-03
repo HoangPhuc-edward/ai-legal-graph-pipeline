@@ -63,61 +63,54 @@ _DIEM_AT_START = re.compile(r"^\s*[a-zđ]\)\s+")
 
 def _split_line_at_headers(line: str) -> list[str]:
     """Tách 1 dòng thành nhiều dòng nếu có marker cấp (Phần/Chương/Mục/Điều) bị
-    dính giữa dòng — ví dụ '...hết hiệu lực.Chương II QUY ĐỊNH CHUNG' (HTML
-    nguồn không có <p> riêng cho từng marker) -> tách thành 2 dòng để
-    `_match_level` (chỉ match đầu dòng) bắt được.
+    dính giữa dòng.
 
     Xử lý 2 case:
       A) marker bị dính SAU nội dung (m.start() > 0): tách TRƯỚC marker.
-         Vòng lặp tiếp theo sẽ xử lý segment mới bắt đầu bằng marker (case B).
-      B) marker ở ĐẦU đoạn nhưng nội dung phía sau là Khoản/Điểm (m.start() == 0,
-         trailing matches Khoản/Điểm pattern): tách SAU marker — để Khoản/Điểm
-         không bị "nuốt" vào title_text của Điều và biến mất khi Điều trở thành cha.
+         Thu thập TẤT CẢ điểm split trong 1 lần scan qua 5 pattern — tách đồng
+         loạt thay vì while-loop cũ chỉ tách 1 điểm mỗi vòng (O(N²) → O(N)).
+      B) marker ở ĐẦU dòng nhưng trailing là Khoản/Điểm: tách SAU marker.
+         Chỉ áp dụng khi không có case A nào (ưu tiên A > B).
          Ví dụ: 'Điều 2. 1. Thu ngân sách...' -> ['Điều 2.', '1. Thu ngân sách...']
-         KHÔNG tách: 'Điều 1. Phạm vi điều chỉnh' (trailing không phải Khoản/Điểm).
+         Không tách: 'Điều 1. Phạm vi điều chỉnh' (trailing là title_text hợp lệ).
     """
-    segments = [line]
-    changed = True
-    while changed:
-        changed = False
-        next_segments: list[str] = []
-        for seg in segments:
-            split_before = None  # case A: tách trước marker
-            split_after = None   # case B: tách sau marker (khi marker ở đầu)
-            for pattern in _FORCE_BREAK_PATTERNS:
-                m = pattern.search(seg)
-                if not m:
-                    continue
-                if m.start() > 0:
-                    if split_before is None or m.start() < split_before:
-                        split_before = m.start()
-                else:
-                    # pos-0 match: kiểm tra trailing có cần split_after không
-                    if split_before is None and split_after is None:
-                        trailing = seg[m.end():]
-                        # Chỉ tách khi trailing bắt đầu bằng Khoản (`\d.`) hoặc Điểm (`a)`)
-                        # — tránh tách "Điều 1. Phạm vi điều chỉnh" (trailing là title_text hợp lệ)
-                        if _KHOAN_AT_START.match(trailing) or _DIEM_AT_START.match(trailing):
-                            split_after = m.end()
-                    # Tiếp tục search từ sau match đầu để tìm marker cùng loại bị dính
-                    # giữa dòng — pattern.search() chỉ trả về match ĐẦU TIÊN, nếu match
-                    # đầu ở pos 0 (Điều 1.) thì Điều 2. phía sau sẽ bị bỏ qua hoàn toàn
-                    # nếu không search lại từ m.end().
-                    m2 = pattern.search(seg, m.end())
-                    if m2 and (split_before is None or m2.start() < split_before):
-                        split_before = m2.start()
-            if split_before is not None:
-                next_segments.append(seg[:split_before])
-                next_segments.append(seg[split_before:])
-                changed = True
-            elif split_after is not None:
-                next_segments.append(seg[:split_after])
-                next_segments.append(seg[split_after:])
-                changed = True
-            else:
-                next_segments.append(seg)
-        segments = next_segments
-    return [s for s in segments if s.strip()]
+    split_points: set[int] = set()
+    case_b_split: Optional[int] = None
+
+    for pattern in _FORCE_BREAK_PATTERNS:
+        pos = 0
+        checked_b = False
+        while True:
+            m = pattern.search(line, pos)
+            if not m:
+                break
+            if m.start() > 0:
+                # Case A — marker bị dính giữa dòng: ghi nhận vị trí tách
+                split_points.add(m.start())
+            elif not checked_b:
+                # Case B — marker ở đầu dòng, chỉ kiểm tra lần đầu mỗi pattern
+                trailing = line[m.end():]
+                if _KHOAN_AT_START.match(trailing) or _DIEM_AT_START.match(trailing):
+                    case_b_split = m.end()
+                checked_b = True
+            pos = m.end() if m.end() > pos else pos + 1
+
+    if split_points:
+        prev = 0
+        segments: list[str] = []
+        for bp in sorted(split_points):
+            seg = line[prev:bp]
+            if seg.strip():
+                segments.append(seg)
+            prev = bp
+        if line[prev:].strip():
+            segments.append(line[prev:])
+        return segments
+
+    if case_b_split is not None:
+        return [s for s in [line[:case_b_split], line[case_b_split:]] if s.strip()]
+
+    return [line] if line.strip() else []
 
 
 def normalize_legal_markdown(markdown: str) -> str:

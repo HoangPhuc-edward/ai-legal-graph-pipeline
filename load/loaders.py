@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_norms(client: Neo4jClient, norms: list[Norm]) -> None:
+    logger.info("Load Norm: %d văn bản...", len(norms))
     cypher = """
     UNWIND $rows AS row
     MERGE (n:Norm {norm_id: row.norm_id})
@@ -49,9 +50,11 @@ def load_norms(client: Neo4jClient, norms: list[Norm]) -> None:
     """
     rows = [n.model_dump(mode="json") for n in norms]
     client.batch_write(cypher, rows)
+    logger.info("Load Norm xong: %d node :Norm", len(norms))
 
 
 def load_components(client: Neo4jClient, components: list[Component]) -> None:
+    logger.info("Load Component: %d component...", len(components))
     node_cypher = """
     UNWIND $rows AS row
     MERGE (c:Component {comp_id: row.comp_id})
@@ -89,6 +92,10 @@ def load_components(client: Neo4jClient, components: list[Component]) -> None:
     """
     client.batch_write(root_cypher, root_edges)
     client.batch_write(nested_cypher, nested_edges)
+    logger.info(
+        "Load Component xong: %d node :Component, %d cạnh CONTAINS gốc, %d cạnh CONTAINS lồng",
+        len(components), len(root_edges), len(nested_edges),
+    )
 
 
 def load_component_textunits(
@@ -98,6 +105,7 @@ def load_component_textunits(
 ) -> None:
     """text_units: chỉ TextUnit type="noi_dung" (sở hữu bởi Component).
     component_owner_map: comp_id -> unit_id."""
+    logger.info("Load TextUnit (nội dung): %d unit...", len(text_units))
     node_cypher = """
     UNWIND $rows AS row
     MERGE (t:TextUnit {unit_id: row.unit_id})
@@ -125,11 +133,16 @@ def load_component_textunits(
     MERGE (c)-[:HAS_TEXTUNIT]->(t)
     """
     client.batch_write(edge_cypher, edges)
+    logger.info(
+        "Load TextUnit (nội dung) xong: %d node :TextUnit, %d cạnh HAS_TEXTUNIT (Component→TextUnit)",
+        len(text_units), len(edges),
+    )
 
 
 def load_actions(client: Neo4jClient, actions: list[Action]) -> None:
     """Chỉ tạo node Action — KHÔNG kèm cạnh (cạnh HAS_ACTION/APPLY_TO tạo ở
     load_action_edges(), vì cần cả Component A và Component B đã tồn tại)."""
+    logger.info("Load Action (node): %d action...", len(actions))
     node_cypher = """
     UNWIND $rows AS row
     MERGE (a:Action {action_id: row.action_id})
@@ -141,6 +154,7 @@ def load_actions(client: Neo4jClient, actions: list[Action]) -> None:
     """
     rows = [a.model_dump(mode="json") for a in actions]
     client.batch_write(node_cypher, rows)
+    logger.info("Load Action xong: %d node :Action", len(actions))
 
 
 def load_action_edges(
@@ -154,6 +168,7 @@ def load_action_edges(
     action_links: list các dict {action_id, comp_a_id, comp_b_id, cache_unit_id}.
     cache_text_units: cache_unit_id -> TextUnit (type="cache_action", embedding=None).
     """
+    logger.info("Load Action edges + TextUnit cache: %d action link...", len(action_links))
     rows = [
         {
             "action_id": link["action_id"],
@@ -176,6 +191,10 @@ def load_action_edges(
     SET tu.accumulated_text = row.cache_text, tu.type = 'cache_action', tu.embedding = null
     """
     client.batch_write(cypher, rows)
+    logger.info(
+        "Load Action edges xong: %d cặp HAS_ACTION + APPLY_TO + %d TextUnit cache :HAS_TEXTUNIT",
+        len(rows), len(rows),
+    )
 
 
 class _LimitReached(Exception):
@@ -289,6 +308,7 @@ def load_relations(client: Neo4jClient, relations: list[NormRelation]) -> None:
     RelationType. Cypher không tham số hoá được relationship type, nhưng
     relation_type luôn xuất phát từ enum cố định (10 giá trị) nên an toàn để
     nội suy trực tiếp vào câu lệnh — nhóm theo loại, 1 query/loại."""
+    logger.info("Load NormRelation: %d cạnh Norm→Norm...", len(relations))
     by_type: dict[str, list[dict]] = {}
     for r in relations:
         by_type.setdefault(r.relation_type.value, []).append(
@@ -303,3 +323,5 @@ def load_relations(client: Neo4jClient, relations: list[NormRelation]) -> None:
         MERGE (a)-[:{relation_type}]->(b)
         """
         client.batch_write(cypher, rows)
+        logger.info("  %s: %d cạnh", relation_type, len(rows))
+    logger.info("Load NormRelation xong: %d cạnh tổng, %d loại", len(relations), len(by_type))

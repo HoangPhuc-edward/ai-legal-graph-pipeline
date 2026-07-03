@@ -21,6 +21,7 @@ Cột thật của th1nhng0/vietnamese-legal-documents (verify qua HF API):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from config import TRANSFORMED_DIR
 from schema.edges import NormRelation
@@ -140,14 +142,21 @@ def _build_component_index_entries(norm_id: str, components: list[Component]) ->
     return index
 
 
-def transform_relationships(
+async def _transform_relationships_async(
     relationships_table: pa.Table,
     docs_by_norm_id: dict[str, TransformedDoc],
     component_index: dict[tuple[str, str], str],
     use_llm: bool = True,
 ) -> tuple[list[NormRelation], list[tuple[Action, TextUnit, str, str]]]:
-    """PASS 2 — xử lý relationships.parquet bằng component_index đã build ở Pass 1.
-    Tầng B chỉ chạy cho các dòng mà doc_id (nguồn) đã có trong docs_by_norm_id."""
+    """PASS 2 async — LLM call trong mỗi văn bản chạy đồng thời qua asyncio.gather()
+    với Semaphore dùng chung (tối đa MAX_CONCURRENT_LLM request bay cùng lúc).
+
+    Thứ tự xử lý quan hệ vẫn tuần tự (outer for loop), nhưng trong mỗi quan hệ
+    tất cả Component cần LLM được gather() song song — giảm latency từ O(N*T)
+    xuống O(T) với T là latency 1 LLM call."""
+    from transform.action_extractor import MAX_CONCURRENT_LLM
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
     def get_component_text_map(norm_id: str) -> dict[str, str]:
         doc = docs_by_norm_id.get(norm_id)
@@ -157,21 +166,28 @@ def transform_relationships(
         doc = docs_by_norm_id.get(norm_id)
         return doc.norm.norm_number if doc else norm_id
 
-    # Tập norm_id đã có Component được index ở Pass 1 — dùng để skip sớm Tầng B
-    # khi văn bản đích chắc chắn không thể khớp (vd ngoài phạm vi --sample).
-    # Tránh gọi LLM (regex + 2 tầng LLM) cho những trường hợp vô vọng.
     known_norm_ids = {norm_id for norm_id, _ in component_index}
 
     relations: list[NormRelation] = []
     actions: list[tuple[Action, TextUnit, str, str]] = []
 
-    for row in relationships_table.to_pylist():
+    doc_ids_arr = pa.array(list(docs_by_norm_id.keys()), type=pa.string())
+    rel_filtered = relationships_table.filter(
+        pc.is_in(
+            pc.cast(relationships_table.column("doc_id"), pa.string()),
+            value_set=doc_ids_arr,
+        )
+    )
+    rel_rows = rel_filtered.to_pylist()
+    total_rels = len(rel_rows)
+    logger.info("Pass 2 bắt đầu — %d quan hệ cần xử lý (đã lọc từ corpus)", total_rels)
+
+    for idx, row in enumerate(rel_rows, 1):
         doc_id = str(row["doc_id"])
         other_doc_id = str(row["other_doc_id"])
         label = row["relationship"]
-        if doc_id not in docs_by_norm_id:
-            continue
-        for item in relation_classifier.process_relationship_row(
+        for item in await relation_classifier.process_relationship_row_async(
+            semaphore=semaphore,
             doc_id=doc_id,
             other_doc_id=other_doc_id,
             relationship_label=label,
@@ -185,6 +201,12 @@ def transform_relationships(
                 relations.append(item)
             else:
                 actions.append(item)
+
+        if idx % 5000 == 0 or idx == total_rels:
+            logger.info(
+                "Pass 2: [%d/%d] quan hệ — %d NormRelation, %d Action tích lũy",
+                idx, total_rels, len(relations), len(actions),
+            )
 
     return relations, actions
 
@@ -232,11 +254,23 @@ def run(
       build component_index sau khi TẤT CẢ worker xong (không parallel được vì
       cần toàn bộ Component trước khi index hoàn chỉnh).
     """
-    metadata_rows = metadata_table.to_pylist()
+    # Fix 4: slice Arrow table TRƯỚC khi convert — tránh materialize 153k dòng rồi bỏ đi
     if sample is not None:
-        metadata_rows = metadata_rows[:sample]
+        metadata_table = metadata_table.slice(0, sample)
+    metadata_rows = metadata_table.to_pylist()
 
-    content_by_id = {row["id"]: row["content_html"] for row in content_table.to_pylist()}
+    # Fix 1: filter content chỉ lấy id cần thiết — tránh materialize toàn bộ 178k HTML.
+    # Cast cả column lẫn value_set về pa.string() vì parquet lưu id dạng large_string.
+    target_ids = pa.array([str(row["id"]) for row in metadata_rows], type=pa.string())
+    content_by_id = {
+        row["id"]: row["content_html"]
+        for row in content_table.filter(
+            pc.is_in(
+                pc.cast(content_table.column("id"), pa.string()),
+                value_set=target_ids,
+            )
+        ).to_pylist()
+    }
 
     # ═══════════ PASS 1 — structure parsing toàn corpus + build component_index ═══════════
     docs_by_norm_id: dict[str, TransformedDoc] = {}
@@ -247,19 +281,36 @@ def run(
         for row in metadata_rows
     ]
 
+    total_docs = len(pairs)
+    logger.info("Pass 1 bắt đầu — %d văn bản cần transform", total_docs)
+
     if workers <= 1:
-        all_docs = _transform_batch(pairs)
+        all_docs = []
+        for idx, pair in enumerate(pairs, 1):
+            all_docs.extend(_transform_batch([pair]))
+            if idx % 500 == 0 or idx == total_docs:
+                n_comp = sum(len(d.components) for d in all_docs)
+                n_tu = sum(len(d.text_units) for d in all_docs)
+                logger.info(
+                    "Pass 1: [%d/%d] văn bản — %d Component, %d TextUnit tích lũy",
+                    idx, total_docs, n_comp, n_tu,
+                )
     else:
-        chunk_size = max(1, len(pairs) // workers)
-        chunks = [pairs[i : i + chunk_size] for i in range(0, len(pairs), chunk_size)]
-        logger.info("Pass 1 — %d văn bản / %d worker / chunk ~%d", len(pairs), len(chunks), chunk_size)
+        chunk_size = max(1, total_docs // workers)
+        chunks = [pairs[i : i + chunk_size] for i in range(0, total_docs, chunk_size)]
+        logger.info("Pass 1 — %d worker, %d chunk (~%d văn bản/chunk)", workers, len(chunks), chunk_size)
         all_docs = []
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_transform_batch, chunk): i for i, chunk in enumerate(chunks)}
             for future in as_completed(futures):
                 chunk_idx = futures[future]
                 try:
-                    all_docs.extend(future.result())
+                    chunk_docs = future.result()
+                    all_docs.extend(chunk_docs)
+                    logger.info(
+                        "Pass 1: chunk %d/%d xong — %d văn bản (tổng tích lũy: %d)",
+                        chunk_idx + 1, len(chunks), len(chunk_docs), len(all_docs),
+                    )
                 except Exception:
                     logger.exception("Worker chunk %d lỗi, bỏ qua.", chunk_idx)
 
@@ -267,10 +318,15 @@ def run(
         docs_by_norm_id[doc.norm.norm_id] = doc
         component_index.update(_build_component_index_entries(doc.norm.norm_id, doc.components))
 
-    # ═══════════ PASS 2 — action extraction xuyên văn bản, dùng component_index ═══════════
-    relations, actions = transform_relationships(
-        relationships_table, docs_by_norm_id, component_index, use_llm=use_llm
+    # ═══════════ PASS 2 — action extraction async, LLM concurrent qua Semaphore ═══════════
+    relations, actions = asyncio.run(
+        _transform_relationships_async(
+            relationships_table, docs_by_norm_id, component_index, use_llm=use_llm
+        )
     )
+
+    from transform import action_extractor as _ae
+    _ae.log_stats()
 
     norms = [doc.norm for doc in docs_by_norm_id.values()]
     components = [c for doc in docs_by_norm_id.values() for c in doc.components]

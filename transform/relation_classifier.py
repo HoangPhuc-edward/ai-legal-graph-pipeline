@@ -6,6 +6,7 @@ component_index đã build xong ở Pass 1, xem transform/pipeline.py).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -74,20 +75,16 @@ def process_relationship_row(
     use_llm: bool = True,
     known_norm_ids: Optional[set[str]] = None,
 ) -> Iterator[NormRelation | ActionResult]:
-    """Sinh 1 NormRelation (Tầng A, luôn có) và 0..n ActionResult (Tầng B — 1
-    Action cho mỗi cặp Component A/Component B khớp được)."""
+    """Sync version — giữ để backward compat với tests.
+    Pipeline dùng process_relationship_row_async."""
     resolved = _resolve_relation(doc_id, other_doc_id, relationship_label)
     if resolved is None:
         return
     from_norm_id, to_norm_id, relation_type = resolved
 
-    # TẦNG A — luôn tạo, không cần regex/LLM, map 1:1
     yield NormRelation(from_norm_id=from_norm_id, to_norm_id=to_norm_id, relation_type=relation_type)
 
-    # TẦNG B — chỉ thử khi loại quan hệ có khái niệm "Component cụ thể"
-    if relation_type not in ELIGIBLE_FOR_LAYER_B:
-        return
-    if get_component_text_map is None:
+    if relation_type not in ELIGIBLE_FOR_LAYER_B or get_component_text_map is None:
         return
 
     component_text = get_component_text_map(from_norm_id)
@@ -104,16 +101,15 @@ def process_relationship_row(
     ):
         comp_b_id = component_index.get((to_norm_id, citation_path))
         if comp_b_id is None:
-            continue  # không khớp được Component B -> bỏ qua, chỉ giữ Tầng A
+            continue
 
         now = datetime.now(timezone.utc)
         amending_doc_number = lookup_norm_number(from_norm_id) if lookup_norm_number else from_norm_id
-
         cache_text_unit = TextUnit(
             unit_id=f"action-cache-{uuid.uuid4().hex}",
             accumulated_text=component_text[comp_a_id],
             type="cache_action",
-            embedding=None,  # KHÔNG embed — bản sao y nguyên của TextUnit Component A
+            embedding=None,
             updated_at=now,
         )
         action = Action(
@@ -123,3 +119,69 @@ def process_relationship_row(
             updated_at=now,
         )
         yield action, cache_text_unit, comp_a_id, comp_b_id
+
+
+async def process_relationship_row_async(
+    semaphore: asyncio.Semaphore,
+    doc_id: str,
+    other_doc_id: str,
+    relationship_label: str,
+    component_index: dict[tuple[str, str], str],
+    get_component_text_map: Optional[Callable[[str], dict[str, str]]] = None,
+    lookup_norm_number: Optional[Callable[[str], str]] = None,
+    use_llm: bool = True,
+    known_norm_ids: Optional[set[str]] = None,
+) -> list[NormRelation | ActionResult]:
+    """Async version — Tầng B dùng find_amendments_async (LLM concurrent).
+    Trả list thay vì generator để caller có thể await hoàn toàn."""
+    results: list[NormRelation | ActionResult] = []
+
+    resolved = _resolve_relation(doc_id, other_doc_id, relationship_label)
+    if resolved is None:
+        return results
+    from_norm_id, to_norm_id, relation_type = resolved
+
+    # TẦNG A — luôn tạo, không cần LLM
+    results.append(NormRelation(from_norm_id=from_norm_id, to_norm_id=to_norm_id, relation_type=relation_type))
+
+    if relation_type not in ELIGIBLE_FOR_LAYER_B or get_component_text_map is None:
+        return results
+
+    component_text = get_component_text_map(from_norm_id)
+    if not component_text:
+        return results
+
+    # TẦNG B — LLM concurrent qua semaphore
+    amendments = await action_extractor.find_amendments_async(
+        semaphore=semaphore,
+        doc_id=from_norm_id,
+        component_text=component_text,
+        other_doc_id=to_norm_id,
+        component_index=component_index,
+        use_llm=use_llm,
+        known_norm_ids=known_norm_ids,
+    )
+
+    for comp_a_id, citation_path in amendments:
+        comp_b_id = component_index.get((to_norm_id, citation_path))
+        if comp_b_id is None:
+            continue
+
+        now = datetime.now(timezone.utc)
+        amending_doc_number = lookup_norm_number(from_norm_id) if lookup_norm_number else from_norm_id
+        cache_text_unit = TextUnit(
+            unit_id=f"action-cache-{uuid.uuid4().hex}",
+            accumulated_text=component_text[comp_a_id],
+            type="cache_action",
+            embedding=None,
+            updated_at=now,
+        )
+        action = Action(
+            action_id=f"action-{uuid.uuid4().hex}",
+            relation_type=relation_type,
+            amending_doc_number=amending_doc_number,
+            updated_at=now,
+        )
+        results.append((action, cache_text_unit, comp_a_id, comp_b_id))
+
+    return results

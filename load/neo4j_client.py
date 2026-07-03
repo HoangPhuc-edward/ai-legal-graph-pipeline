@@ -53,4 +53,4 @@ class Neo4jClient:
             for i in range(0, len(rows), batch_size):
                 batch = rows[i : i + batch_size]
                 session.run(cypher, rows=batch)
-        logger.info("Đã ghi %d dòng (batch_size=%d)", len(rows), batch_size)
+        logger.debug("batch_write: %d dòng, batch_size=%d", len(rows), batch_size)

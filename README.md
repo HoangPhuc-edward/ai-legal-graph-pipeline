@@ -96,8 +96,11 @@ Kết quả ghi ra `data/samples/sample.json` / `data/samples/keyword_search.jso
 
 ## Test
 
+### Unit tests (không cần kết nối ngoài)
+
 ```bash
-pytest
+pytest                              # chạy tất cả unit test
+pytest tests/test_action_extractor.py -v
 ```
 
 - `tests/test_structure_parser.py` — fixture đủ 7 cấp, thiếu Phần/Mục, chỉ có Điều
@@ -106,9 +109,48 @@ pytest
   `citation_path`, và phân biệt được "Khoản 1" trùng số ở 2 Điều khác nhau nhờ luôn kèm Điều tổ tiên.
 - `tests/test_action_extractor.py` — `find_amendments` khớp được cả 2 đầu (Component A + citation
   Component B) cho 4 khuôn mẫu (SUA_DOI/BO_SUNG, BAI_BO, THAY_THE_CUM_TU, BO_CUM_TU), và không tạo
-  Action khi citation không khớp được `component_index` (chỉ giữ Tầng A). Khi chạy trên corpus thật,
-  nên đo lại tỷ lệ tách theo `norm_type`/năm ban hành (văn bản trước 2016 hoặc cấp địa phương dự
-  kiến tỷ lệ match thấp hơn).
+  Action khi citation không khớp được `component_index` (chỉ giữ Tầng A).
+- `tests/test_relation_label_map.py` — tất cả 17 nhãn thực tế trong `relationships.parquet`
+  đều có trong `RELATION_LABEL_MAP` hoặc `REVERSE_RELATION_LABEL_MAP`.
+
+### Integration tests — Neo4j RAG quality (chạy sau `--stage load`)
+
+**Yêu cầu**: `.env` đã có `NEO4J_URI` + `NEO4J_PASSWORD`. Nếu chưa set hoặc không kết nối
+được, toàn bộ test tự động **skip** (không fail).
+
+```bash
+# Điền thông tin Neo4j vào .env trước:
+# NEO4J_URI=neo4j+s://<id>.databases.neo4j.io
+# NEO4J_USER=neo4j
+# NEO4J_PASSWORD=<password từ AuraDB console>
+
+# Chạy toàn bộ (16 test case):
+pytest tests/test_neo4j_rag_quality.py -v
+
+# Chạy theo nhóm:
+pytest tests/test_neo4j_rag_quality.py -v -m critical     # 5 test chặn RAG (ưu tiên trước)
+pytest tests/test_neo4j_rag_quality.py -v -m sanity       # nhóm 1: phủ cơ bản (TC-01 → TC-04)
+pytest tests/test_neo4j_rag_quality.py -v -m structure    # nhóm 2: đúng đắn cấu trúc (TC-05 → TC-08)
+pytest tests/test_neo4j_rag_quality.py -v -m rag          # nhóm 3: khả năng RAG truy xuất (TC-09 → TC-12)
+pytest tests/test_neo4j_rag_quality.py -v -m content      # nhóm 4: tính đúng nội dung (TC-13 → TC-14)
+pytest tests/test_neo4j_rag_quality.py -v -m performance  # nhóm 5: hiệu năng (TC-15 → TC-16)
+```
+
+**Thứ tự ưu tiên** khi debug: `TC-03 → TC-09 → TC-10 → TC-05 → TC-06` (các test này thất bại
+thì RAG không dùng được).
+
+**TC-09 / TC-10 / TC-15 / TC-16** (vector search) cần tạo vector index thủ công sau khi `embed`
+xong — chưa có trong `schema_init.cypher`:
+
+```cypher
+CREATE VECTOR INDEX textunit_embedding_index IF NOT EXISTS
+FOR (t:TextUnit) ON (t.embedding)
+OPTIONS {indexConfig: {`vector.dimensions`: 3072, `vector.similarity_function`: 'cosine'}};
+```
+
+Chạy lệnh trên trong **Neo4j Browser** (`https://<id>.databases.neo4j.io`) hoặc
+`cypher-shell`. Sau khi tạo, chờ Neo4j populate index (có thể vài phút với corpus lớn)
+rồi mới chạy lại test.
 
 ## Lưu ý khi chạy full corpus
 
@@ -119,4 +161,4 @@ pytest
    brief — `transform/pipeline.py` đã map đúng theo cột thật (`so_ky_hieu`, `loai_van_ban`,
    `ngay_ban_hanh`, `tinh_trang_hieu_luc`, ...).
 3. Chạy `--stage transform --sample 200` trước, kiểm tra vài chục `Component`/`Action`
-   sinh ra bằng mắt, trước khi chạy `--stage all` trên toàn bộ corpus.
+   sinh ra bằng mắt, trước khi chạy `--stage all` trên toàn bộ 
