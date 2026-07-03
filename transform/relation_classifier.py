@@ -72,6 +72,7 @@ def process_relationship_row(
     get_component_text_map: Optional[Callable[[str], dict[str, str]]] = None,
     lookup_norm_number: Optional[Callable[[str], str]] = None,
     use_llm: bool = True,
+    known_norm_ids: Optional[set[str]] = None,
 ) -> Iterator[NormRelation | ActionResult]:
     """Sinh 1 NormRelation (Tầng A, luôn có) và 0..n ActionResult (Tầng B — 1
     Action cho mỗi cặp Component A/Component B khớp được)."""
@@ -99,6 +100,7 @@ def process_relationship_row(
         other_doc_id=to_norm_id,
         component_index=component_index,
         use_llm=use_llm,
+        known_norm_ids=known_norm_ids,
     ):
         comp_b_id = component_index.get((to_norm_id, citation_path))
         if comp_b_id is None:
