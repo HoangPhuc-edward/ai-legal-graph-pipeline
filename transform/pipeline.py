@@ -157,6 +157,11 @@ def transform_relationships(
         doc = docs_by_norm_id.get(norm_id)
         return doc.norm.norm_number if doc else norm_id
 
+    # Tập norm_id đã có Component được index ở Pass 1 — dùng để skip sớm Tầng B
+    # khi văn bản đích chắc chắn không thể khớp (vd ngoài phạm vi --sample).
+    # Tránh gọi LLM (regex + 2 tầng LLM) cho những trường hợp vô vọng.
+    known_norm_ids = {norm_id for norm_id, _ in component_index}
+
     relations: list[NormRelation] = []
     actions: list[tuple[Action, TextUnit, str, str]] = []
 
@@ -174,6 +179,7 @@ def transform_relationships(
             get_component_text_map=get_component_text_map,
             lookup_norm_number=lookup_norm_number,
             use_llm=use_llm,
+            known_norm_ids=known_norm_ids,
         ):
             if isinstance(item, NormRelation):
                 relations.append(item)

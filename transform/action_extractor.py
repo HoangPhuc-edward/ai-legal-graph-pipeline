@@ -117,13 +117,28 @@ def find_amendments(
     other_doc_id: str,
     component_index: dict[tuple[str, str], str],
     use_llm: bool = True,
+    known_norm_ids: Optional[set[str]] = None,
 ) -> Iterator[tuple[str, str]]:
     """Duyệt qua text của từng Component LÁ trong doc_id (Component A ứng viên),
     cố khớp được citation_path của Component B đã tồn tại trong component_index
     (đã build ở Pass 1 cho other_doc_id). Yield (comp_a_id, citation_path) cho
     mỗi Component A khớp được — KHÔNG tự resolve thành comp_b_id (việc đó do
     relation_classifier làm, dùng cùng component_index).
+
+    known_norm_ids: set các norm_id đã có Component được index (thường build 1
+    lần từ component_index — xem relation_classifier). Nếu other_doc_id KHÔNG
+    nằm trong tập này (ví dụ: chạy --sample nhỏ và văn bản đích không thuộc
+    mẫu), thì KHÔNG THỂ khớp được dù trích citation đúng đến đâu — bỏ qua toàn
+    bộ regex/LLM ngay, tránh tốn lệnh gọi LLM chắc chắn vô ích.
     """
+    if known_norm_ids is not None and other_doc_id not in known_norm_ids:
+        logger.info(
+            "Văn bản đích %s không có Component nào trong component_index "
+            "(ngoài phạm vi --sample hoặc chưa parse được) — bỏ qua Tầng B cho doc %s, chỉ giữ Tầng A.",
+            other_doc_id, doc_id,
+        )
+        return
+
     for comp_a_id, text in component_text.items():
         if not text or not text.strip():
             continue
