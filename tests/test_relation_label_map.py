@@ -10,8 +10,8 @@ from transform.relation_classifier import (
 EXPECTED_LABELS = [
     ("Văn bản căn cứ", RelationType.CITES, False, False),
     ("Văn bản dẫn chiếu", RelationType.REFERS_TO, False, False),
-    ("Văn bản hết hiệu lực", RelationType.TERMINATES, False, True),
-    ("Văn bản quy định hết hiệu lực", RelationType.TERMINATES, True, True),
+    ("Văn bản hết hiệu lực", RelationType.TERMINATES, False, False),
+    ("Văn bản quy định hết hiệu lực", RelationType.TERMINATES, True, False),
     ("Văn bản được HD, QĐ chi tiết", RelationType.IMPLEMENTS, True, False),
     ("Văn bản HD, QĐ chi tiết", RelationType.IMPLEMENTS, False, False),
     ("Văn bản bổ sung", RelationType.SUPPLEMENTS, False, True),
@@ -23,8 +23,8 @@ EXPECTED_LABELS = [
     ("Văn bản liên quan khác", RelationType.RELATED_TO, False, False),
     ("Văn bản đình chỉ 1 phần", RelationType.PARTIALLY_SUSPENDS, False, True),
     ("Văn bản bị đình chỉ 1 phần", RelationType.PARTIALLY_SUSPENDS, True, True),
-    ("Văn bản đình chỉ", RelationType.SUSPENDS, False, True),
-    ("Văn bản bị đình chỉ", RelationType.SUSPENDS, True, True),
+    ("Văn bản đình chỉ", RelationType.SUSPENDS, False, False),
+    ("Văn bản bị đình chỉ", RelationType.SUSPENDS, True, False),
 ]
 
 

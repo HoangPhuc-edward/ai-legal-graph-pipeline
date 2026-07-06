@@ -124,23 +124,31 @@ pytest tests/test_action_extractor.py -v
 # NEO4J_USER=neo4j
 # NEO4J_PASSWORD=<password từ AuraDB console>
 
-# Chạy toàn bộ (16 test case):
+# Chạy toàn bộ (8 test case):
 pytest tests/test_neo4j_rag_quality.py -v
 
-# Chạy theo nhóm:
-pytest tests/test_neo4j_rag_quality.py -v -m critical     # 5 test chặn RAG (ưu tiên trước)
-pytest tests/test_neo4j_rag_quality.py -v -m sanity       # nhóm 1: phủ cơ bản (TC-01 → TC-04)
-pytest tests/test_neo4j_rag_quality.py -v -m structure    # nhóm 2: đúng đắn cấu trúc (TC-05 → TC-08)
-pytest tests/test_neo4j_rag_quality.py -v -m rag          # nhóm 3: khả năng RAG truy xuất (TC-09 → TC-12)
-pytest tests/test_neo4j_rag_quality.py -v -m content      # nhóm 4: tính đúng nội dung (TC-13 → TC-14)
-pytest tests/test_neo4j_rag_quality.py -v -m performance  # nhóm 5: hiệu năng (TC-15 → TC-16)
+# Chỉ chạy 6 test chặn RAG:
+pytest tests/test_neo4j_rag_quality.py -v -m critical
 ```
 
-**Thứ tự ưu tiên** khi debug: `TC-03 → TC-09 → TC-10 → TC-05 → TC-06` (các test này thất bại
-thì RAG không dùng được).
+**8 test case** (xem `TEST_BRIEF.md` để biết logic chi tiết):
 
-**TC-09 / TC-10 / TC-15 / TC-16** (vector search) cần tạo vector index thủ công sau khi `embed`
-xong — chưa có trong `schema_init.cypher`:
+| TC | Kiểm tra | Chặn RAG? |
+|---|---|---|
+| TC-01 | Node lá có TextUnit (≥95%) | Có |
+| TC-02 | Cây không đứt gãy (Component → Norm) | Có |
+| TC-03 | Action đủ 2 đầu (HAS_ACTION + APPLY_TO) | Có |
+| TC-04 | Vector index tồn tại và đầy đủ | Có |
+| TC-05 | Traversal ngược TextUnit → Norm lấy được số hiệu | Có |
+| TC-06 | Vector search end-to-end (embed → index → kết quả hợp lý) | Có |
+| TC-07 | TextUnit không rỗng (< 1% quá ngắn) | Gián tiếp |
+| TC-08 | Citation path đúng chiều (không bị đảo ngược) | Có |
+
+**Thứ tự ưu tiên** khi debug: `TC-01 → TC-02 → TC-04 → TC-06` — 4 test này đủ xác nhận
+RAG chạy được hay không. TC-03 / TC-05 / TC-07 / TC-08 chạy khi cần debug sâu hơn.
+
+**TC-04 / TC-05 / TC-06** cần tạo vector index thủ công sau khi `embed` xong — chưa có
+trong `schema_init.cypher`:
 
 ```cypher
 CREATE VECTOR INDEX textunit_embedding_index IF NOT EXISTS
@@ -150,7 +158,7 @@ OPTIONS {indexConfig: {`vector.dimensions`: 3072, `vector.similarity_function`: 
 
 Chạy lệnh trên trong **Neo4j Browser** (`https://<id>.databases.neo4j.io`) hoặc
 `cypher-shell`. Sau khi tạo, chờ Neo4j populate index (có thể vài phút với corpus lớn)
-rồi mới chạy lại test.
+rồi mới chạy lại test. TC-04 / TC-05 / TC-06 tự **skip** nếu index chưa tồn tại.
 
 ## Lưu ý khi chạy full corpus
 
