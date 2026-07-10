@@ -27,10 +27,11 @@ import logging
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi, hf_hub_download
 
-from config import DATA_DIR, HF_DATASET_REPO, RAW_DIR
+from config import DATA_DIR, FILTERED_DIR, HF_DATASET_REPO, RAW_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,92 @@ def search_by_keywords(
     return matched
 
 
+def filter_to_parquet(
+    keywords_path: Path = DEFAULT_KEYWORDS_PATH,
+    limit: int | None = None,
+    raw_dir: Path = RAW_DIR,
+    output_dir: Path = FILTERED_DIR,
+    batch_size: int = 500,
+) -> dict[str, int]:
+    """Lọc 3 file parquet theo từ khoá, ghi ra output_dir dưới dạng parquet.
+
+    Bước 1: quét content.parquet theo batch → thu thập matched_ids
+    Bước 2: lọc metadata.parquet → ghi output_dir/metadata.parquet
+    Bước 3: lọc content.parquet   → ghi output_dir/content.parquet
+    Bước 4: lọc relationships.parquet (doc_id HOẶC other_doc_id trong matched_ids)
+             → ghi output_dir/relationships.parquet
+
+    Không bao giờ load full file vào RAM — toàn bộ dùng iter_batches + ParquetWriter.
+    Trả về dict {config: số_dòng} để báo cáo.
+    """
+    keywords = _load_keywords(keywords_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Bước 1 — quét content → matched_ids
+    content_path = _ensure_local_table_path("content", raw_dir)
+    pf = pq.ParquetFile(content_path)
+    matched_ids: set[int] = set()
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["id", "content_html"]):
+        ids = batch.column("id").to_pylist()
+        htmls = batch.column("content_html").to_pylist()
+        for doc_id, html in zip(ids, htmls):
+            if html and any(kw in html.lower() for kw in keywords):
+                matched_ids.add(doc_id)
+                if limit is not None and len(matched_ids) >= limit:
+                    break
+        if limit is not None and len(matched_ids) >= limit:
+            break
+
+    logger.info("Khớp từ khoá %s: %d văn bản", keywords, len(matched_ids))
+    if not matched_ids:
+        logger.warning("Không có văn bản nào khớp từ khoá — không ghi file.")
+        return {}
+
+    # value_set dùng chung cho is_in — cast về string vì id có thể lưu dạng large_string
+    matched_arr = pa.array([str(x) for x in matched_ids], type=pa.string())
+    counts: dict[str, int] = {}
+
+    def _filter_and_write(src_path: Path, out_path: Path, id_columns: list[str]) -> int:
+        """Đọc src_path theo batch, giữ dòng có ít nhất 1 id_column nằm trong matched_arr."""
+        writer = None
+        n = 0
+        try:
+            pf2 = pq.ParquetFile(src_path)
+            for batch in pf2.iter_batches(batch_size=batch_size if "content" in src_path.name else 5000):
+                tbl = pa.Table.from_batches([batch])
+                mask = None
+                for col in id_columns:
+                    m = pc.is_in(pc.cast(tbl.column(col), pa.string()), value_set=matched_arr)
+                    mask = m if mask is None else pc.or_(mask, m)
+                filtered = tbl.filter(mask)
+                if filtered.num_rows == 0:
+                    continue
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, filtered.schema)
+                writer.write_table(filtered)
+                n += filtered.num_rows
+        finally:
+            if writer:
+                writer.close()
+        return n
+
+    # Bước 2 — lọc metadata
+    meta_path = _ensure_local_table_path("metadata", raw_dir)
+    counts["metadata"] = _filter_and_write(meta_path, output_dir / "metadata.parquet", ["id"])
+    logger.info("metadata.parquet: %d dòng → %s", counts["metadata"], output_dir / "metadata.parquet")
+
+    # Bước 3 — lọc content
+    counts["content"] = _filter_and_write(content_path, output_dir / "content.parquet", ["id"])
+    logger.info("content.parquet: %d dòng → %s", counts["content"], output_dir / "content.parquet")
+
+    # Bước 4 — lọc relationships (cả 2 chiều)
+    rel_path = _ensure_local_table_path("relationships", raw_dir)
+    counts["relationships"] = _filter_and_write(rel_path, output_dir / "relationships.parquet", ["doc_id", "other_doc_id"])
+    logger.info("relationships.parquet: %d dòng → %s", counts["relationships"], output_dir / "relationships.parquet")
+
+    return counts
+
+
 def sample_data(n: int = 100, raw_dir: Path = RAW_DIR, batch_size: int = 500) -> dict[int, dict]:
     """Lấy mẫu an toàn để chạy thử pipeline: N metadata đầu tiên (mặc định 100) ->
     content tương ứng -> tối đa N quan hệ liên quan tới N văn bản đó.
@@ -325,11 +412,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p_keyword = sub.add_parser(
         "keyword",
-        help="Tìm content_html khớp từ khoá trong keywords.txt, trả về content + metadata + relationships liên quan",
+        help="Lọc 3 parquet theo từ khoá trong keywords.txt → ghi ra data/filtered/ để dùng với --stage transform --input-dir data/filtered",
     )
     p_keyword.add_argument("--keywords-file", type=Path, default=DEFAULT_KEYWORDS_PATH)
     p_keyword.add_argument("--limit", type=int, default=None, help="Giới hạn số văn bản khớp (mặc định: lấy full)")
-    p_keyword.add_argument("--output", type=Path, default=SAMPLES_DIR / "keyword_search.json")
+    p_keyword.add_argument("--output-dir", type=Path, default=FILTERED_DIR, help="Thư mục ghi parquet đã lọc (mặc định: data/filtered/)")
 
     p_sample = sub.add_parser(
         "sample",
@@ -358,8 +445,17 @@ def main() -> None:
             rows = pq.ParquetFile(p).metadata.num_rows
             print(f"  {cfg:20s} {rows:>10,} dòng  ->  {p}")
     elif args.command == "keyword":
-        result = search_by_keywords(keywords_path=args.keywords_file, limit=args.limit)
-        _write_result(result, args.output)
+        counts = filter_to_parquet(
+            keywords_path=args.keywords_file,
+            limit=args.limit,
+            output_dir=args.output_dir,
+        )
+        if counts:
+            print(f"\nĐã ghi parquet đã lọc vào {args.output_dir}:")
+            for cfg, n in counts.items():
+                print(f"  {cfg:20s} {n:>10,} dòng")
+            print(f"\nChạy tiếp:")
+            print(f"  python run_pipeline.py --stage transform --input-dir {args.output_dir}")
     elif args.command == "sample":
         result = sample_data(n=args.n)
         _write_result(result, args.output)

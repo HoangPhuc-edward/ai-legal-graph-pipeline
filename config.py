@@ -25,10 +25,11 @@ HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "th1nhng0/vietnamese-legal-docume
 # --- Đường dẫn dữ liệu trung gian ---
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
 RAW_DIR = DATA_DIR / "raw"
+FILTERED_DIR = DATA_DIR / "filtered"
 TRANSFORMED_DIR = DATA_DIR / "transformed"
 EMBEDDED_DIR = DATA_DIR / "embedded"
 
-for _dir in (RAW_DIR, TRANSFORMED_DIR, EMBEDDED_DIR):
+for _dir in (RAW_DIR, FILTERED_DIR, TRANSFORMED_DIR, EMBEDDED_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 # --- Bảng rank cấp văn bản (Component) — số nhỏ hơn = cấp cao hơn (nông hơn trong cây) ---

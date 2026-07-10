@@ -19,7 +19,7 @@ import json
 import logging
 from pathlib import Path
 
-from config import EMBEDDED_DIR, RAW_DIR, TRANSFORMED_DIR
+from config import EMBEDDED_DIR, FILTERED_DIR, RAW_DIR, TRANSFORMED_DIR
 from schema.edges import NormRelation
 from schema.nodes import Action, Component, Norm, TextUnit
 
@@ -51,11 +51,12 @@ def stage_extract() -> None:
     hf_dataset.download_all()
 
 
-def stage_transform(sample: int | None, use_llm: bool, workers: int = 1) -> None:
+def stage_transform(sample: int | None, use_llm: bool, workers: int = 1, input_dir: Path | None = None) -> None:
     from extract import hf_dataset
     from transform import pipeline as transform_pipeline
 
-    tables = hf_dataset.load_local(RAW_DIR)
+    src = input_dir or RAW_DIR
+    tables = hf_dataset.load_local(src)
     transform_pipeline.run(
         metadata_table=tables["metadata"],
         content_table=tables["content"],
@@ -172,6 +173,12 @@ def main() -> None:
         action="store_true",
         help="Giới hạn load không vượt 200k node / 400k edge (AuraDB Free)",
     )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=None,
+        help="Thư mục parquet input cho transform (mặc định: data/raw/). Dùng data/filtered/ sau khi chạy keyword filter.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -181,7 +188,7 @@ def main() -> None:
     if args.stage in ("extract", "all"):
         stage_extract()
     if args.stage in ("transform", "all"):
-        stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers)
+        stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers, input_dir=args.input_dir)
     if args.stage in ("embed", "all"):
         stage_embed()
     if args.stage in ("load", "all"):

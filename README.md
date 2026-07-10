@@ -50,6 +50,7 @@ python run_pipeline.py --stage extract                              # tải parq
 python run_pipeline.py --stage transform --sample 200              # test trước khi full
 python run_pipeline.py --stage transform --sample 200 --no-llm     # chỉ dùng regex, không gọi LLM
 python run_pipeline.py --stage transform --sample 200 --workers 4  # song song Pass 1 (Colab)
+python run_pipeline.py --stage transform --input-dir data/filtered  # dùng parquet đã lọc keyword
 python run_pipeline.py --stage embed                               # vector hoá TextUnit (tốn phí)
 python run_pipeline.py --stage load                                # nạp vào Neo4j
 python run_pipeline.py --stage load --limit-aura                   # giới hạn 200k node / 400k edge
@@ -78,11 +79,11 @@ Chạy lại nhiều lần **không bị duplicate** — file JSON ghi đè, Neo
 python -m extract.hf_dataset sample           # N=100, ghi ra data/samples/sample.json
 python -m extract.hf_dataset sample --n 20   # giảm xuống 20 nếu máy yếu
 
-# Tìm content_html khớp từ khoá trong extract/keywords.txt
-# -> content + metadata + relationships liên quan, ghi ra JSON
-python -m extract.hf_dataset keyword                  # quét full, lấy tất cả kết quả
-python -m extract.hf_dataset keyword --limit 50       # giới hạn 50 văn bản khớp
-python -m extract.hf_dataset keyword --keywords-file PATH --output PATH  # tuỳ chỉnh file
+# Lọc 3 parquet theo từ khoá → ghi data/filtered/*.parquet (giảm input cho transform)
+# Sau đó dùng --input-dir data/filtered để transform chỉ xử lý subset này
+python -m extract.hf_dataset keyword                              # quét full, ghi data/filtered/
+python -m extract.hf_dataset keyword --limit 5000                 # giới hạn 5000 văn bản khớp
+python -m extract.hf_dataset keyword --keywords-file PATH --output-dir PATH  # tuỳ chỉnh
 
 # Tải parquet (dành cho Colab / lưu vào Google Drive):
 python -m extract.hf_dataset download                               # tải cả 3, bỏ qua file đã có
@@ -91,8 +92,7 @@ python -m extract.hf_dataset download --configs metadata relationships  # chỉ 
 python -m extract.hf_dataset download --force                       # tải lại dù đã có sẵn
 ```
 
-Kết quả ghi ra `data/samples/sample.json` / `data/samples/keyword_search.json`
-(tự tạo thư mục). Nếu parquet chưa có cục bộ, lệnh tự tải về `data/raw/` trước khi dùng.
+Kết quả `keyword` ghi ra `data/filtered/*.parquet` — dùng với `--input-dir data/filtered` ở bước transform. Nếu parquet chưa có cục bộ, lệnh tự tải về `data/raw/` trước khi dùng.
 
 ## Test
 
