@@ -144,7 +144,9 @@ def _build_component_index_entries(norm_id: str, components: list[Component]) ->
 
 async def _transform_relationships_async(
     relationships_table: pa.Table,
-    docs_by_norm_id: dict[str, TransformedDoc],
+    norm_ids: set[str],
+    comp_texts_by_norm: dict[str, dict[str, str]],
+    norm_numbers: dict[str, str],
     component_index: dict[tuple[str, str], str],
     use_llm: bool = True,
 ) -> tuple[list[NormRelation], list[tuple[Action, TextUnit, str, str]]]:
@@ -159,19 +161,17 @@ async def _transform_relationships_async(
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
     def get_component_text_map(norm_id: str) -> dict[str, str]:
-        doc = docs_by_norm_id.get(norm_id)
-        return doc.component_text if doc else {}
+        return comp_texts_by_norm.get(norm_id, {})
 
     def lookup_norm_number(norm_id: str) -> str:
-        doc = docs_by_norm_id.get(norm_id)
-        return doc.norm.norm_number if doc else norm_id
+        return norm_numbers.get(norm_id, norm_id)
 
     known_norm_ids = {norm_id for norm_id, _ in component_index}
 
     relations: list[NormRelation] = []
     actions: list[tuple[Action, TextUnit, str, str]] = []
 
-    doc_ids_arr = pa.array(list(docs_by_norm_id.keys()), type=pa.string())
+    doc_ids_arr = pa.array(list(norm_ids), type=pa.string())
     rel_filtered = relationships_table.filter(
         pc.is_in(
             pc.cast(relationships_table.column("doc_id"), pa.string()),
@@ -248,11 +248,13 @@ def run(
 ) -> None:
     """Orchestrate toàn bộ transform stage (2 pass), ghi kết quả ra JSON Lines.
 
+    RAM-safe: Norm/Component/TextUnit được ghi ra đĩa ngay sau mỗi doc (Pass 1)
+    thay vì tích lũy trong RAM. Chỉ giữ component_index + comp_texts_by_norm
+    (text thuần, không có Pydantic overhead) cho Pass 2.
+
     workers=1 (mặc định, an toàn cho laptop 8GB): sequential, không spawn process.
     workers>1 (gợi ý Colab: 4): Pass 1 chạy parallel bằng ProcessPoolExecutor —
-      mỗi worker xử lý 1 chunk văn bản độc lập, main process merge kết quả và
-      build component_index sau khi TẤT CẢ worker xong (không parallel được vì
-      cần toàn bộ Component trước khi index hoàn chỉnh).
+      mỗi worker xử lý 1 chunk, main process stream-write kết quả từng chunk khi xong.
     """
     # Fix 4: slice Arrow table TRƯỚC khi convert — tránh materialize 153k dòng rồi bỏ đi
     if sample is not None:
@@ -272,80 +274,101 @@ def run(
         ).to_pylist()
     }
 
-    # ═══════════ PASS 1 — structure parsing toàn corpus + build component_index ═══════════
-    docs_by_norm_id: dict[str, TransformedDoc] = {}
+    # ═══════════ PASS 1 — structure parsing + stream-write ngay để giải phóng RAM ═══════════
+    # Chỉ giữ trong RAM những gì Pass 2 cần:
+    #   component_index        dict[(norm_id, citation_path) → comp_id]   ~compact strings
+    #   comp_texts_by_norm     dict[norm_id → dict[comp_id → text]]        ~thay thế doc.component_text
+    #   norm_numbers           dict[norm_id → norm_number]                 ~tiny
+    #   component_textunit_map dict[comp_id → unit_id]                     ~compact strings
+    # Norm/Component/TextUnit objects được ghi ra đĩa ngay — không tích lũy trong RAM.
     component_index: dict[tuple[str, str], str] = {}
+    comp_texts_by_norm: dict[str, dict[str, str]] = {}
+    norm_numbers: dict[str, str] = {}
+    component_textunit_map: dict[str, str] = {}
 
     pairs = [
         (row, content_by_id.get(row["id"]) or content_by_id.get(str(row["id"])) or "")
         for row in metadata_rows
     ]
-
+    del content_by_id  # HTML thô không cần nữa sau khi build pairs → giải phóng RAM sớm
     total_docs = len(pairs)
     logger.info("Pass 1 bắt đầu — %d văn bản cần transform", total_docs)
 
-    if workers <= 1:
-        all_docs = []
-        for idx, pair in enumerate(pairs, 1):
-            all_docs.extend(_transform_batch([pair]))
-            if idx % 500 == 0 or idx == total_docs:
-                n_comp = sum(len(d.components) for d in all_docs)
-                n_tu = sum(len(d.text_units) for d in all_docs)
-                logger.info(
-                    "Pass 1: [%d/%d] văn bản — %d Component, %d TextUnit tích lũy",
-                    idx, total_docs, n_comp, n_tu,
-                )
-    else:
-        chunk_size = max(1, total_docs // workers)
-        chunks = [pairs[i : i + chunk_size] for i in range(0, total_docs, chunk_size)]
-        logger.info("Pass 1 — %d worker, %d chunk (~%d văn bản/chunk)", workers, len(chunks), chunk_size)
-        all_docs = []
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_transform_batch, chunk): i for i, chunk in enumerate(chunks)}
-            for future in as_completed(futures):
-                chunk_idx = futures[future]
-                try:
-                    chunk_docs = future.result()
-                    all_docs.extend(chunk_docs)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_comp_total = 0
+    n_tu_total = 0
+
+    def _process_and_stream(docs: list[TransformedDoc], f_norms, f_comps, f_tu) -> None:
+        nonlocal n_comp_total, n_tu_total
+        for doc in docs:
+            f_norms.write(doc.norm.model_dump_json() + "\n")
+            for c in doc.components:
+                f_comps.write(c.model_dump_json() + "\n")
+            for tu in doc.text_units:
+                f_tu.write(tu.model_dump_json() + "\n")
+            norm_id = doc.norm.norm_id
+            component_index.update(_build_component_index_entries(norm_id, doc.components))
+            comp_texts_by_norm[norm_id] = doc.component_text
+            norm_numbers[norm_id] = doc.norm.norm_number
+            component_textunit_map.update(doc.component_text_unit)
+            n_comp_total += len(doc.components)
+            n_tu_total += len(doc.text_units)
+
+    with (
+        open(output_dir / "norms.jsonl", "w", encoding="utf-8") as f_norms,
+        open(output_dir / "components.jsonl", "w", encoding="utf-8") as f_comps,
+        open(output_dir / "textunits.jsonl", "w", encoding="utf-8") as f_tu,
+    ):
+        if workers <= 1:
+            for idx, pair in enumerate(pairs, 1):
+                _process_and_stream(_transform_batch([pair]), f_norms, f_comps, f_tu)
+                if idx % 500 == 0 or idx == total_docs:
                     logger.info(
-                        "Pass 1: chunk %d/%d xong — %d văn bản (tổng tích lũy: %d)",
-                        chunk_idx + 1, len(chunks), len(chunk_docs), len(all_docs),
+                        "Pass 1: [%d/%d] văn bản — %d Component, %d TextUnit (đã ghi đĩa)",
+                        idx, total_docs, n_comp_total, n_tu_total,
                     )
-                except Exception:
-                    logger.exception("Worker chunk %d lỗi, bỏ qua.", chunk_idx)
+        else:
+            chunk_size = max(1, total_docs // workers)
+            chunks = [pairs[i : i + chunk_size] for i in range(0, total_docs, chunk_size)]
+            logger.info("Pass 1 — %d worker, %d chunk (~%d văn bản/chunk)", workers, len(chunks), chunk_size)
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_transform_batch, chunk): i for i, chunk in enumerate(chunks)}
+                for future in as_completed(futures):
+                    chunk_idx = futures[future]
+                    try:
+                        chunk_docs = future.result()
+                        _process_and_stream(chunk_docs, f_norms, f_comps, f_tu)
+                        logger.info(
+                            "Pass 1: chunk %d/%d xong — %d văn bản trong chunk (tổng: %d Component, %d TextUnit đã ghi)",
+                            chunk_idx + 1, len(chunks), len(chunk_docs), n_comp_total, n_tu_total,
+                        )
+                    except Exception:
+                        logger.exception("Worker chunk %d lỗi, bỏ qua.", chunk_idx)
 
-    for doc in all_docs:
-        docs_by_norm_id[doc.norm.norm_id] = doc
-        component_index.update(_build_component_index_entries(doc.norm.norm_id, doc.components))
-
-    # ═══════════ PASS 2 — action extraction async, LLM concurrent qua Semaphore ═══════════
-    relations, actions = asyncio.run(
-        _transform_relationships_async(
-            relationships_table, docs_by_norm_id, component_index, use_llm=use_llm
+        # ═══════════ PASS 2 — action extraction async, LLM concurrent qua Semaphore ═══════════
+        relations, actions = asyncio.run(
+            _transform_relationships_async(
+                relationships_table,
+                norm_ids=set(norm_numbers.keys()),
+                comp_texts_by_norm=comp_texts_by_norm,
+                norm_numbers=norm_numbers,
+                component_index=component_index,
+                use_llm=use_llm,
+            )
         )
-    )
+
+        # Append cache TextUnit (type="cache_action") vào textunits.jsonl đã ghi ở Pass 1
+        cache_text_units = [tu for _, tu, _, _ in actions]
+        for tu in cache_text_units:
+            f_tu.write(tu.model_dump_json() + "\n")
 
     from transform import action_extractor as _ae
     _ae.log_stats()
 
-    norms = [doc.norm for doc in docs_by_norm_id.values()]
-    components = [c for doc in docs_by_norm_id.values() for c in doc.components]
-    component_text_units = [tu for doc in docs_by_norm_id.values() for tu in doc.text_units]
-    cache_text_units = [tu for _, tu, _, _ in actions]
     action_objs = [a for a, _, _, _ in actions]
-
-    _write_jsonl(output_dir / "norms.jsonl", norms)
-    _write_jsonl(output_dir / "components.jsonl", components)
-    _write_jsonl(output_dir / "textunits.jsonl", component_text_units + cache_text_units)
     _write_jsonl(output_dir / "actions.jsonl", action_objs)
     _write_jsonl(output_dir / "relations.jsonl", relations)
 
-    # component_textunit_map: comp_id -> unit_id (HAS_TEXTUNIT từ Component, type="noi_dung")
-    component_textunit_map = {
-        comp_id: unit_id
-        for doc in docs_by_norm_id.values()
-        for comp_id, unit_id in doc.component_text_unit.items()
-    }
     with open(output_dir / "component_textunit_map.json", "w", encoding="utf-8") as f:
         json.dump(component_textunit_map, f, ensure_ascii=False, indent=2)
 
@@ -367,9 +390,9 @@ def run(
 
     logger.info(
         "Transform xong (2 pass): %d Norm, %d Component, %d TextUnit (%d cache), %d Action, %d NormRelation",
-        len(norms),
-        len(components),
-        len(component_text_units) + len(cache_text_units),
+        len(norm_numbers),
+        n_comp_total,
+        n_tu_total + len(cache_text_units),
         len(cache_text_units),
         len(action_objs),
         len(relations),
