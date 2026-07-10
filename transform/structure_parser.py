@@ -20,9 +20,6 @@ LEVEL_PATTERNS: list[tuple[ComponentLevel, re.Pattern]] = [
     (ComponentLevel.PHAN, re.compile(r"^\s*Phần\s+(thứ\s+)?([IVXLCDM\d]+)\b", re.IGNORECASE)),
     (ComponentLevel.CHUONG, re.compile(r"^\s*Chương\s+([IVXLCDM\d]+)\b", re.IGNORECASE)),
     (ComponentLevel.MUC, re.compile(r"^\s*(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE)),
-    # Không dùng re.IGNORECASE — [a-zđ] phải chỉ match lowercase để tránh nuốt
-    # chữ hoa đầu của content vào số Điều (vd "Điều 2Công dân" → Điều 2C nếu IGNORECASE).
-    # Match cả "Điều" và "điều" bằng [Đđ]iều thay vì IGNORECASE toàn pattern.
     (ComponentLevel.DIEU, re.compile(r"^\s*[Đđ]iều\s+(\d+[a-zđ]?)\s*[\.\:]?")),
     (ComponentLevel.KHOAN, re.compile(r"^\s*(\d{1,2})\.\s+")),
     (ComponentLevel.DIEM, re.compile(r"^\s*([a-zđ])\)\s+")),
