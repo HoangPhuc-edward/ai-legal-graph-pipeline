@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Generator, Iterable
@@ -35,6 +36,27 @@ _MAX_RETRIES = 5
 _INITIAL_WAIT_SEC = 60  # quota reset theo phút — không dùng giá trị < 60
 
 EMBED_ERRORS_FILE = TRANSFORMED_DIR / "embed_errors.jsonl"
+
+
+class RateLimiter:
+    """Token bucket: giới hạn số API call theo requests/phút (RPM).
+
+    Thread-safe — nhiều thread cùng gọi acquire() sẽ xếp hàng đợi token.
+    Dùng để chủ động không vượt quota Vertex AI thay vì bị 429 rồi mới retry.
+    """
+
+    def __init__(self, rpm: int):
+        self._lock = threading.Lock()
+        self._interval = 60.0 / max(rpm, 1)  # giây giữa 2 request liên tiếp
+        self._next_allowed: float = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait > 0:
+                time.sleep(wait)
+            self._next_allowed = time.monotonic() + self._interval
 
 
 def _get_client():

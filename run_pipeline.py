@@ -68,12 +68,14 @@ def stage_transform(sample: int | None, use_llm: bool, workers: int = 1, input_d
     )
 
 
-def stage_embed(concurrency: int = 4) -> None:
-    """RAM-safe + song song: đọc textunits.jsonl từng dòng, embed theo batch, ghi ngay.
+def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
+    """RAM-safe + rate-limited: đọc textunits.jsonl từng dòng, embed theo batch, ghi ngay.
 
-    Gửi `concurrency` API request đồng thời qua ThreadPoolExecutor để tăng throughput.
-    Batch size 250 (max Vertex AI cho phép) — giảm số round-trip so với mặc định 100.
-    Chỉ giữ `concurrency * 250` TextUnit trong RAM tại một thời điểm.
+    rpm: giới hạn requests/phút gửi tới Vertex AI — để không bị 429 quota.
+         Mặc định 60 RPM = 1 req/s → 60×250 = 15k TextUnit/phút = 900k/hr.
+         Giảm xuống --embed-rpm 30 nếu vẫn còn 429.
+    concurrency: số request gửi đồng thời. Với rate limiting, tăng concurrency
+         giúp pipeline I/O không bị stall nhưng throughput vẫn bị giới hạn bởi rpm.
     """
     from concurrent.futures import Future, ThreadPoolExecutor
     from datetime import datetime, timezone
@@ -96,8 +98,12 @@ def stage_embed(concurrency: int = 4) -> None:
         return
 
     BATCH = 250  # Vertex AI tối đa 250 inputs/request
+    rate_limiter = gemini_embedding.RateLimiter(rpm=rpm)
+    logger.info("Embed bắt đầu: batch=%d, concurrency=%d, rpm=%d (%.1f req/s)",
+                BATCH, concurrency, rpm, rpm / 60)
 
     def _embed_one_batch(batch: list[TextUnit]) -> list[TextUnit]:
+        rate_limiter.acquire()  # chặn tại đây nếu đang gửi quá nhanh
         to_embed = [tu for tu in batch if tu.accumulated_text.strip()]
         no_text = [tu for tu in batch if not tu.accumulated_text.strip()]
         for tu in no_text:
@@ -137,7 +143,7 @@ def stage_embed(concurrency: int = 4) -> None:
                 succeeded += 1
             elif tu.type != "cache_action" and tu.error_log:
                 failed += 1
-        if total % 50_000 < BATCH or total % 50_000 == 0:
+        if total % 50_000 < BATCH:
             logger.info("Embed: %d ghi xong (%d OK, %d lỗi)...", total, succeeded, failed)
 
     with (
@@ -272,6 +278,16 @@ def main() -> None:
         default=4,
         help="Số API request embed song song (mặc định 4). Giảm xuống 1 nếu bị 429 liên tục.",
     )
+    parser.add_argument(
+        "--embed-rpm",
+        type=int,
+        default=60,
+        help=(
+            "Giới hạn requests/phút gửi tới Vertex AI embedding (mặc định 60).\n"
+            "60 RPM × 250 batch = 15k TextUnit/phút = 900k/hr.\n"
+            "Giảm xuống 30 nếu vẫn bị 429. Tăng lên 120-300 nếu quota cho phép."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -283,7 +299,7 @@ def main() -> None:
     if args.stage in ("transform", "all"):
         stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers, input_dir=args.input_dir)
     if args.stage in ("embed", "all"):
-        stage_embed(concurrency=args.embed_concurrency)
+        stage_embed(concurrency=args.embed_concurrency, rpm=args.embed_rpm)
     if args.stage in ("load", "all"):
         stage_load(limit_aura=args.limit_aura)
 
