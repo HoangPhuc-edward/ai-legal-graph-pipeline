@@ -91,6 +91,21 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
 
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
 
+    # --- Resume: đọc unit_id đã ghi để skip khi chạy lại ---
+    done_ids: set[str] = set()
+    if out_path.exists():
+        with open(out_path, "r", encoding="utf-8") as f_check:
+            for line in f_check:
+                line = line.strip()
+                if line:
+                    try:
+                        uid = TextUnit.model_validate_json(line).unit_id
+                        done_ids.add(uid)
+                    except Exception:
+                        pass
+        if done_ids:
+            logger.info("Resume: tìm thấy %d TextUnit đã embed trong %s — sẽ bỏ qua.", len(done_ids), out_path)
+
     try:
         client = gemini_embedding._get_client()
     except Exception as exc:
@@ -123,7 +138,7 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
                     tu.error_log = None
         return no_text + to_embed
 
-    total = succeeded = failed = 0
+    total = skipped = succeeded = failed = 0
     embed_batch: list[TextUnit] = []
     active_futures: list[Future] = []
 
@@ -146,9 +161,12 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
         if total % 50_000 < BATCH:
             logger.info("Embed: %d ghi xong (%d OK, %d lỗi)...", total, succeeded, failed)
 
+    # Nếu resume: append vào file hiện có; nếu lần đầu: tạo mới
+    file_mode = "a" if done_ids else "w"
+
     with (
         open(in_path, "r", encoding="utf-8") as f_in,
-        open(out_path, "w", encoding="utf-8") as f_out,
+        open(out_path, file_mode, encoding="utf-8") as f_out,
         ThreadPoolExecutor(max_workers=concurrency) as executor,
     ):
         for line in f_in:
@@ -156,6 +174,9 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
             if not line:
                 continue
             tu = TextUnit.model_validate_json(line)
+            if tu.unit_id in done_ids:
+                skipped += 1
+                continue
             if tu.type == "cache_action":
                 f_out.write(tu.model_dump_json() + "\n")
                 total += 1
@@ -170,7 +191,11 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
         while active_futures:
             _drain_one(f_out)
 
-    logger.info("Embed xong %d TextUnit (%d OK, %d lỗi) -> %s", total, succeeded, failed, out_path)
+    if skipped:
+        logger.info("Embed xong %d TextUnit mới (%d OK, %d lỗi) + %d đã có sẵn -> %s",
+                    total, succeeded, failed, skipped, out_path)
+    else:
+        logger.info("Embed xong %d TextUnit (%d OK, %d lỗi) -> %s", total, succeeded, failed, out_path)
 
 
 def _read_load_artifacts():
