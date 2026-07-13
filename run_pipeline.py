@@ -91,20 +91,34 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
 
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # --- Resume: đọc unit_id đã ghi để skip khi chạy lại ---
+    # --- Resume: đọc output hiện có, giữ lại unit thành công, retry unit lỗi ---
     done_ids: set[str] = set()
     if out_path.exists():
+        successful_lines: list[str] = []
+        retry_count = 0
         with open(out_path, "r", encoding="utf-8") as f_check:
             for line in f_check:
                 line = line.strip()
-                if line:
-                    try:
-                        uid = TextUnit.model_validate_json(line).unit_id
-                        done_ids.add(uid)
-                    except Exception:
-                        pass
-        if done_ids:
-            logger.info("Resume: tìm thấy %d TextUnit đã embed trong %s — sẽ bỏ qua.", len(done_ids), out_path)
+                if not line:
+                    continue
+                try:
+                    tu = TextUnit.model_validate_json(line)
+                    if tu.embedding is not None or tu.type == "cache_action":
+                        done_ids.add(tu.unit_id)
+                        successful_lines.append(line)
+                    else:
+                        retry_count += 1  # embedding=None → sẽ embed lại
+                except Exception:
+                    pass
+        if done_ids or retry_count:
+            # Rewrite output chỉ giữ unit thành công; unit lỗi sẽ được append sau
+            with open(out_path, "w", encoding="utf-8") as f_rewrite:
+                for line in successful_lines:
+                    f_rewrite.write(line + "\n")
+            logger.info(
+                "Resume: %d đã embed OK (giữ lại), %d lỗi (sẽ retry lại lần này).",
+                len(done_ids), retry_count,
+            )
 
     try:
         client = gemini_embedding._get_client()
