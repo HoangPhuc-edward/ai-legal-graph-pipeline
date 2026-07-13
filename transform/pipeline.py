@@ -256,44 +256,43 @@ def run(
     workers>1 (gợi ý Colab: 4): Pass 1 chạy parallel bằng ProcessPoolExecutor —
       mỗi worker xử lý 1 chunk, main process stream-write kết quả từng chunk khi xong.
     """
-    # Fix 4: slice Arrow table TRƯỚC khi convert — tránh materialize 153k dòng rồi bỏ đi
     if sample is not None:
         metadata_table = metadata_table.slice(0, sample)
     metadata_rows = metadata_table.to_pylist()
 
-    # Fix 1: filter content chỉ lấy id cần thiết — tránh materialize toàn bộ 178k HTML.
-    # Cast cả column lẫn value_set về pa.string() vì parquet lưu id dạng large_string.
-    target_ids = pa.array([str(row["id"]) for row in metadata_rows], type=pa.string())
-    content_by_id = {
-        row["id"]: row["content_html"]
-        for row in content_table.filter(
-            pc.is_in(
-                pc.cast(content_table.column("id"), pa.string()),
-                value_set=target_ids,
-            )
-        ).to_pylist()
+    # Index gọn của metadata (không có HTML) — ~22MB cho 47k docs
+    meta_by_id: dict[str, dict] = {str(row["id"]): row for row in metadata_rows}
+    del metadata_rows
+    target_id_set = set(meta_by_id.keys())
+    total_docs = len(meta_by_id)
+
+    # Pre-compute tập norm_id có amend relationship → chỉ lưu comp_texts cho những docs này
+    # (docs không amend ai thì Pass 2 không cần component_text của chúng)
+    amending_norm_ids: set[str] = {
+        str(v)
+        for v in relationships_table.column("doc_id").to_pylist()
     }
 
+    # Filter content table — giữ dạng Arrow (columnar, ~compact), KHÔNG gọi .to_pylist() toàn bộ
+    target_ids_arr = pa.array(list(target_id_set), type=pa.string())
+    content_filtered = content_table.filter(
+        pc.is_in(pc.cast(content_table.column("id"), pa.string()), value_set=target_ids_arr)
+    )
+
     # ═══════════ PASS 1 — structure parsing + stream-write ngay để giải phóng RAM ═══════════
-    # Chỉ giữ trong RAM những gì Pass 2 cần:
-    #   component_index        dict[(norm_id, citation_path) → comp_id]   ~compact strings
-    #   comp_texts_by_norm     dict[norm_id → dict[comp_id → text]]        ~thay thế doc.component_text
-    #   norm_numbers           dict[norm_id → norm_number]                 ~tiny
-    #   component_textunit_map dict[comp_id → unit_id]                     ~compact strings
-    # Norm/Component/TextUnit objects được ghi ra đĩa ngay — không tích lũy trong RAM.
+    # Trong RAM chỉ giữ:
+    #   component_index        dict[(norm_id, citation_path) → comp_id]
+    #   comp_texts_by_norm     dict[norm_id → dict[comp_id → text]]  — CHỈ cho amending docs
+    #   norm_numbers           dict[norm_id → norm_number]
+    #   component_textunit_map dict[comp_id → unit_id]
+    # Norm/Component/TextUnit objects ghi ra đĩa ngay — không tích lũy.
     component_index: dict[tuple[str, str], str] = {}
     comp_texts_by_norm: dict[str, dict[str, str]] = {}
     norm_numbers: dict[str, str] = {}
     component_textunit_map: dict[str, str] = {}
 
-    pairs = [
-        (row, content_by_id.get(row["id"]) or content_by_id.get(str(row["id"])) or "")
-        for row in metadata_rows
-    ]
-    del content_by_id  # HTML thô không cần nữa sau khi build pairs → giải phóng RAM sớm
-    total_docs = len(pairs)
-    logger.info("Pass 1 bắt đầu — %d văn bản cần transform", total_docs)
-
+    logger.info("Pass 1 bắt đầu — %d văn bản cần transform (%d docs có relationship)",
+                total_docs, len(amending_norm_ids & target_id_set))
     output_dir.mkdir(parents=True, exist_ok=True)
     n_comp_total = 0
     n_tu_total = 0
@@ -308,11 +307,16 @@ def run(
                 f_tu.write(tu.model_dump_json() + "\n")
             norm_id = doc.norm.norm_id
             component_index.update(_build_component_index_entries(norm_id, doc.components))
-            comp_texts_by_norm[norm_id] = doc.component_text
+            # Chỉ giữ comp_texts cho docs thực sự có amend relationship (tiết kiệm RAM)
+            if norm_id in amending_norm_ids:
+                comp_texts_by_norm[norm_id] = doc.component_text
             norm_numbers[norm_id] = doc.norm.norm_number
             component_textunit_map.update(doc.component_text_unit)
             n_comp_total += len(doc.components)
             n_tu_total += len(doc.text_units)
+
+    # Số HTML strings trong Python memory tại một thời điểm
+    CONTENT_BATCH = 200
 
     with (
         open(output_dir / "norms.jsonl", "w", encoding="utf-8") as f_norms,
@@ -320,27 +324,78 @@ def run(
         open(output_dir / "textunits.jsonl", "w", encoding="utf-8") as f_tu,
     ):
         if workers <= 1:
-            for idx, pair in enumerate(pairs, 1):
-                _process_and_stream(_transform_batch([pair]), f_norms, f_comps, f_tu)
-                if idx % 500 == 0 or idx == total_docs:
-                    logger.info(
-                        "Pass 1: [%d/%d] văn bản — %d Component, %d TextUnit (đã ghi đĩa)",
-                        idx, total_docs, n_comp_total, n_tu_total,
-                    )
+            processed_ids: set[str] = set()
+            idx = 0
+            # Stream content 200 rows tại một thời điểm — không bao giờ to_pylist() toàn bộ
+            for batch in content_filtered.to_batches(max_chunksize=CONTENT_BATCH):
+                batch_rows = batch.to_pylist()
+                batch_pairs = [
+                    (meta_by_id[str(r["id"])], r["content_html"] or "")
+                    for r in batch_rows
+                    if str(r["id"]) in meta_by_id
+                ]
+                for r in batch_rows:
+                    processed_ids.add(str(r["id"]))
+                if batch_pairs:
+                    _process_and_stream(_transform_batch(batch_pairs), f_norms, f_comps, f_tu)
+                    idx += len(batch_pairs)
+                    if idx % 2000 < CONTENT_BATCH or idx >= total_docs:
+                        logger.info(
+                            "Pass 1: [%d/%d] văn bản — %d Component, %d TextUnit (đã ghi đĩa)",
+                            idx, total_docs, n_comp_total, n_tu_total,
+                        )
+            # Metadata rows không có HTML (scan PDF) — tạo Norm nhưng không có TextUnit
+            no_html_ids = target_id_set - processed_ids
+            if no_html_ids:
+                no_html_pairs = [(meta_by_id[doc_id], "") for doc_id in no_html_ids]
+                logger.info("Pass 1: %d văn bản không có HTML", len(no_html_pairs))
+                _process_and_stream(_transform_batch(no_html_pairs), f_norms, f_comps, f_tu)
+                idx += len(no_html_pairs)
+            logger.info(
+                "Pass 1 hoàn tất: %d/%d văn bản — %d Component, %d TextUnit",
+                idx, total_docs, n_comp_total, n_tu_total,
+            )
         else:
-            chunk_size = max(1, total_docs // workers)
-            chunks = [pairs[i : i + chunk_size] for i in range(0, total_docs, chunk_size)]
-            logger.info("Pass 1 — %d worker, %d chunk (~%d văn bản/chunk)", workers, len(chunks), chunk_size)
+            # workers > 1: collect pairs từ content batches, dispatch từng chunk_size docs
+            chunk_size = max(CONTENT_BATCH, total_docs // workers)
+            logger.info("Pass 1 — %d worker, chunk_size ~%d", workers, chunk_size)
+            pending: list[tuple[dict, str]] = []
+            processed_ids_w: set[str] = set()
+            idx = 0
+            chunk_num = 0
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(_transform_batch, chunk): i for i, chunk in enumerate(chunks)}
+                futures: dict = {}
+
+                def _submit_chunk(chunk: list) -> None:
+                    nonlocal chunk_num
+                    futures[executor.submit(_transform_batch, chunk)] = chunk_num
+                    chunk_num += 1
+
+                for batch in content_filtered.to_batches(max_chunksize=CONTENT_BATCH):
+                    for r in batch.to_pylist():
+                        doc_id = str(r["id"])
+                        if doc_id in meta_by_id:
+                            pending.append((meta_by_id[doc_id], r["content_html"] or ""))
+                            processed_ids_w.add(doc_id)
+                    while len(pending) >= chunk_size:
+                        _submit_chunk(pending[:chunk_size])
+                        pending = pending[chunk_size:]
+
+                if pending:
+                    _submit_chunk(pending)
+                no_html = [(meta_by_id[d], "") for d in target_id_set - processed_ids_w]
+                if no_html:
+                    _submit_chunk(no_html)
+
                 for future in as_completed(futures):
                     chunk_idx = futures[future]
                     try:
                         chunk_docs = future.result()
                         _process_and_stream(chunk_docs, f_norms, f_comps, f_tu)
+                        idx += len(chunk_docs)
                         logger.info(
-                            "Pass 1: chunk %d/%d xong — %d văn bản trong chunk (tổng: %d Component, %d TextUnit đã ghi)",
-                            chunk_idx + 1, len(chunks), len(chunk_docs), n_comp_total, n_tu_total,
+                            "Pass 1: chunk %d xong (tổng tích lũy: %d Component, %d TextUnit)",
+                            chunk_idx, n_comp_total, n_tu_total,
                         )
                     except Exception:
                         logger.exception("Worker chunk %d lỗi, bỏ qua.", chunk_idx)
