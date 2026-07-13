@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Vertex AI text-embedding endpoints chấp nhận tối đa ~250 input/request — giữ
 # margin an toàn để tránh lỗi payload quá lớn.
-EMBED_REQUEST_BATCH_SIZE = 100
+EMBED_REQUEST_BATCH_SIZE = 250  # Vertex AI tối đa 250 inputs/request
 
 _MAX_RETRIES = 5
 _INITIAL_WAIT_SEC = 60  # quota reset theo phút — không dùng giá trị < 60

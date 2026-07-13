@@ -68,12 +68,16 @@ def stage_transform(sample: int | None, use_llm: bool, workers: int = 1, input_d
     )
 
 
-def stage_embed() -> None:
-    """RAM-safe: đọc textunits.jsonl từng dòng, embed theo batch 100, ghi ngay ra disk.
+def stage_embed(concurrency: int = 4) -> None:
+    """RAM-safe + song song: đọc textunits.jsonl từng dòng, embed theo batch, ghi ngay.
 
-    Không bao giờ load toàn bộ TextUnit vào RAM — với ~580k TextUnit, load đủ 1 lần
-    sẽ dùng >1.7GB chỉ riêng embedding vectors.
+    Gửi `concurrency` API request đồng thời qua ThreadPoolExecutor để tăng throughput.
+    Batch size 250 (max Vertex AI cho phép) — giảm số round-trip so với mặc định 100.
+    Chỉ giữ `concurrency * 250` TextUnit trong RAM tại một thời điểm.
     """
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from datetime import datetime, timezone
+
     from embed import gemini_embedding
 
     in_path = TRANSFORMED_DIR / "textunits.jsonl"
@@ -85,22 +89,82 @@ def stage_embed() -> None:
 
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _iter_text_units():
-        with open(in_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    yield TextUnit.model_validate_json(line)
+    try:
+        client = gemini_embedding._get_client()
+    except Exception as exc:
+        logger.exception("Không khởi tạo được embedding client")
+        return
 
-    total = 0
-    with open(out_path, "w", encoding="utf-8") as f_out:
-        for tu in gemini_embedding.embed_stream(_iter_text_units()):
+    BATCH = 250  # Vertex AI tối đa 250 inputs/request
+
+    def _embed_one_batch(batch: list[TextUnit]) -> list[TextUnit]:
+        to_embed = [tu for tu in batch if tu.accumulated_text.strip()]
+        no_text = [tu for tu in batch if not tu.accumulated_text.strip()]
+        for tu in no_text:
+            tu.error_log = "accumulated_text rỗng — bỏ qua embed"
+        if to_embed:
+            embeddings = gemini_embedding._embed_batch_with_retry(client, to_embed)
+            if embeddings is None:
+                error_msg = "Hết lần retry (429 quota) hoặc lỗi không retry được"
+                for tu in to_embed:
+                    tu.error_log = error_msg
+                gemini_embedding._write_embed_errors([tu.unit_id for tu in to_embed], error_msg)
+            else:
+                now = datetime.now(timezone.utc)
+                for tu, emb in zip(to_embed, embeddings):
+                    tu.embedding = list(emb.values)
+                    tu.embedded_at = now
+                    tu.error_log = None
+        return no_text + to_embed
+
+    total = succeeded = failed = 0
+    embed_batch: list[TextUnit] = []
+    active_futures: list[Future] = []
+
+    def _submit():
+        if embed_batch:
+            snapshot = list(embed_batch)
+            embed_batch.clear()
+            active_futures.append(executor.submit(_embed_one_batch, snapshot))
+
+    def _drain_one(f_out):
+        nonlocal total, succeeded, failed
+        fut = active_futures.pop(0)
+        for tu in fut.result():
             f_out.write(tu.model_dump_json() + "\n")
             total += 1
-            if total % 10_000 == 0:
-                logger.info("Embed: đã ghi %d TextUnit...", total)
+            if tu.embedding is not None:
+                succeeded += 1
+            elif tu.type != "cache_action" and tu.error_log:
+                failed += 1
+        if total % 50_000 < BATCH or total % 50_000 == 0:
+            logger.info("Embed: %d ghi xong (%d OK, %d lỗi)...", total, succeeded, failed)
 
-    logger.info("Embed xong %d TextUnit -> %s", total, out_path)
+    with (
+        open(in_path, "r", encoding="utf-8") as f_in,
+        open(out_path, "w", encoding="utf-8") as f_out,
+        ThreadPoolExecutor(max_workers=concurrency) as executor,
+    ):
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            tu = TextUnit.model_validate_json(line)
+            if tu.type == "cache_action":
+                f_out.write(tu.model_dump_json() + "\n")
+                total += 1
+                continue
+            embed_batch.append(tu)
+            if len(embed_batch) >= BATCH:
+                _submit()
+                if len(active_futures) >= concurrency:
+                    _drain_one(f_out)
+
+        _submit()  # batch cuối
+        while active_futures:
+            _drain_one(f_out)
+
+    logger.info("Embed xong %d TextUnit (%d OK, %d lỗi) -> %s", total, succeeded, failed, out_path)
 
 
 def _read_load_artifacts():
@@ -202,6 +266,12 @@ def main() -> None:
         default=None,
         help="Thư mục parquet input cho transform (mặc định: data/raw/). Dùng data/filtered/ sau khi chạy keyword filter.",
     )
+    parser.add_argument(
+        "--embed-concurrency",
+        type=int,
+        default=4,
+        help="Số API request embed song song (mặc định 4). Giảm xuống 1 nếu bị 429 liên tục.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -213,7 +283,7 @@ def main() -> None:
     if args.stage in ("transform", "all"):
         stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers, input_dir=args.input_dir)
     if args.stage in ("embed", "all"):
-        stage_embed()
+        stage_embed(concurrency=args.embed_concurrency)
     if args.stage in ("load", "all"):
         stage_load(limit_aura=args.limit_aura)
 
