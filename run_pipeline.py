@@ -69,15 +69,38 @@ def stage_transform(sample: int | None, use_llm: bool, workers: int = 1, input_d
 
 
 def stage_embed() -> None:
+    """RAM-safe: đọc textunits.jsonl từng dòng, embed theo batch 100, ghi ngay ra disk.
+
+    Không bao giờ load toàn bộ TextUnit vào RAM — với ~580k TextUnit, load đủ 1 lần
+    sẽ dùng >1.7GB chỉ riêng embedding vectors.
+    """
     from embed import gemini_embedding
 
-    text_units = _read_jsonl(TRANSFORMED_DIR / "textunits.jsonl", TextUnit)
-    if not text_units:
+    in_path = TRANSFORMED_DIR / "textunits.jsonl"
+    out_path = EMBEDDED_DIR / "textunits.jsonl"
+
+    if not in_path.exists():
         logger.warning("Không có TextUnit nào để embed — chạy --stage transform trước.")
         return
-    gemini_embedding.embed_text_units(text_units)
-    _write_jsonl(EMBEDDED_DIR / "textunits.jsonl", text_units)
-    logger.info("Embed xong %d TextUnit -> %s", len(text_units), EMBEDDED_DIR / "textunits.jsonl")
+
+    EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _iter_text_units():
+        with open(in_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield TextUnit.model_validate_json(line)
+
+    total = 0
+    with open(out_path, "w", encoding="utf-8") as f_out:
+        for tu in gemini_embedding.embed_stream(_iter_text_units()):
+            f_out.write(tu.model_dump_json() + "\n")
+            total += 1
+            if total % 10_000 == 0:
+                logger.info("Embed: đã ghi %d TextUnit...", total)
+
+    logger.info("Embed xong %d TextUnit -> %s", total, out_path)
 
 
 def _read_load_artifacts():

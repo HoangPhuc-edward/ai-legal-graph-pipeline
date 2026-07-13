@@ -20,6 +20,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Generator, Iterable
 
 from config import EMBEDDING_MODEL, GCP_LOCATION, GCP_PROJECT, TRANSFORMED_DIR
 from schema.nodes import TextUnit
@@ -149,3 +150,73 @@ def embed_text_units(
         logger.info("Embed xong: %d thành công, 0 thất bại.", succeeded)
 
     return text_units
+
+
+def embed_stream(
+    text_units: Iterable[TextUnit],
+    batch_size: int = EMBED_REQUEST_BATCH_SIZE,
+) -> Generator[TextUnit, None, None]:
+    """RAM-safe generator: yield từng TextUnit đã embed, xử lý theo batch.
+
+    Chỉ giữ tối đa `batch_size` TextUnit trong Python memory tại một thời điểm.
+    type="cache_action" được yield ngay không cần embed.
+    Caller nên ghi mỗi TextUnit ra file ngay sau khi nhận để giải phóng RAM.
+    """
+    try:
+        client = _get_client()
+    except Exception as exc:
+        logger.exception("Không khởi tạo được embedding client")
+        for tu in text_units:
+            tu.error_log = f"Lỗi khởi tạo client: {exc}"
+            yield tu
+        return
+
+    batch: list[TextUnit] = []
+    succeeded = 0
+    failed = 0
+
+    def _flush_batch() -> list[TextUnit]:
+        nonlocal succeeded, failed
+        to_embed = [tu for tu in batch if tu.accumulated_text.strip()]
+        no_text = [tu for tu in batch if not tu.accumulated_text.strip()]
+        for tu in no_text:
+            tu.error_log = "accumulated_text rỗng — bỏ qua embed"
+
+        if to_embed:
+            embeddings = _embed_batch_with_retry(client, to_embed)
+            if embeddings is None:
+                error_msg = "Hết lần retry (429 quota) hoặc lỗi không retry được"
+                for tu in to_embed:
+                    tu.error_log = error_msg
+                _write_embed_errors([tu.unit_id for tu in to_embed], error_msg)
+                failed += len(to_embed)
+            else:
+                now = datetime.now(timezone.utc)
+                for tu, emb in zip(to_embed, embeddings):
+                    tu.embedding = list(emb.values)
+                    tu.embedded_at = now
+                    tu.error_log = None
+                succeeded += len(to_embed)
+
+        result = no_text + to_embed
+        batch.clear()
+        return result
+
+    for tu in text_units:
+        if tu.type == "cache_action":
+            yield tu
+            continue
+        batch.append(tu)
+        if len(batch) >= batch_size:
+            yield from _flush_batch()
+
+    if batch:
+        yield from _flush_batch()
+
+    if failed:
+        logger.warning(
+            "embed_stream xong: %d thành công, %d thất bại — xem %s",
+            succeeded, failed, EMBED_ERRORS_FILE,
+        )
+    else:
+        logger.info("embed_stream xong: %d thành công", succeeded)
