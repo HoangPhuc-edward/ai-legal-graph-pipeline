@@ -68,7 +68,7 @@ def stage_transform(sample: int | None, use_llm: bool, workers: int = 1, input_d
     )
 
 
-def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
+def stage_embed(concurrency: int = 4, rpm: int = 60, direct_to_graph: bool = False) -> None:
     """RAM-safe + rate-limited: đọc textunits.jsonl từng dòng, embed theo batch, ghi ngay.
 
     rpm: giới hạn requests/phút gửi tới Vertex AI — để không bị 429 quota.
@@ -76,6 +76,8 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
          Giảm xuống --embed-rpm 30 nếu vẫn còn 429.
     concurrency: số request gửi đồng thời. Với rate limiting, tăng concurrency
          giúp pipeline I/O không bị stall nhưng throughput vẫn bị giới hạn bởi rpm.
+    direct_to_graph: nếu True, upsert embedding thẳng lên Neo4j thay vì ghi JSONL.
+         Yêu cầu --stage load đã chạy trước để TextUnit node tồn tại trong Neo4j.
     """
     from concurrent.futures import Future, ThreadPoolExecutor
     from datetime import datetime, timezone
@@ -83,12 +85,60 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
     from embed import gemini_embedding
 
     in_path = TRANSFORMED_DIR / "textunits.jsonl"
-    out_path = EMBEDDED_DIR / "textunits.jsonl"
 
     if not in_path.exists():
         logger.warning("Không có TextUnit nào để embed — chạy --stage transform trước.")
         return
 
+    if direct_to_graph:
+        _stage_embed_direct(in_path, concurrency=concurrency, rpm=rpm)
+    else:
+        _stage_embed_jsonl(in_path, concurrency=concurrency, rpm=rpm)
+
+
+def _build_embed_loop(concurrency: int, rpm: int):
+    """Trả về (embed_client, rate_limiter, _embed_one_batch) dùng chung cho cả 2 mode."""
+    from datetime import datetime, timezone
+
+    from embed import gemini_embedding
+
+    try:
+        embed_client = gemini_embedding._get_client()
+    except Exception:
+        logger.exception("Không khởi tạo được embedding client")
+        return None, None, None
+
+    rate_limiter = gemini_embedding.RateLimiter(rpm=rpm)
+
+    def _embed_one_batch(batch: list[TextUnit]) -> list[TextUnit]:
+        rate_limiter.acquire()
+        to_embed = [tu for tu in batch if tu.accumulated_text.strip()]
+        no_text = [tu for tu in batch if not tu.accumulated_text.strip()]
+        for tu in no_text:
+            tu.error_log = "accumulated_text rỗng — bỏ qua embed"
+        if to_embed:
+            embeddings = gemini_embedding._embed_batch_with_retry(embed_client, to_embed)
+            if embeddings is None:
+                error_msg = "Hết lần retry (429 quota) hoặc lỗi không retry được"
+                for tu in to_embed:
+                    tu.error_log = error_msg
+                gemini_embedding._write_embed_errors([tu.unit_id for tu in to_embed], error_msg)
+            else:
+                now = datetime.now(timezone.utc)
+                for tu, emb in zip(to_embed, embeddings):
+                    tu.embedding = list(emb.values)
+                    tu.embedded_at = now
+                    tu.error_log = None
+        return no_text + to_embed
+
+    return embed_client, rate_limiter, _embed_one_batch
+
+
+def _stage_embed_jsonl(in_path: Path, concurrency: int, rpm: int) -> None:
+    """Mode mặc định: embed → ghi EMBEDDED_DIR/textunits.jsonl."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    out_path = EMBEDDED_DIR / "textunits.jsonl"
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Resume: đọc output hiện có, giữ lại unit thành công, retry unit lỗi ---
@@ -107,11 +157,10 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
                         done_ids.add(tu.unit_id)
                         successful_lines.append(line)
                     else:
-                        retry_count += 1  # embedding=None → sẽ embed lại
+                        retry_count += 1
                 except Exception:
                     pass
         if done_ids or retry_count:
-            # Rewrite output chỉ giữ unit thành công; unit lỗi sẽ được append sau
             with open(out_path, "w", encoding="utf-8") as f_rewrite:
                 for line in successful_lines:
                     f_rewrite.write(line + "\n")
@@ -120,37 +169,12 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
                 len(done_ids), retry_count,
             )
 
-    try:
-        client = gemini_embedding._get_client()
-    except Exception as exc:
-        logger.exception("Không khởi tạo được embedding client")
+    _, _, _embed_one_batch = _build_embed_loop(concurrency, rpm)
+    if _embed_one_batch is None:
         return
 
-    BATCH = 250  # Vertex AI tối đa 250 inputs/request
-    rate_limiter = gemini_embedding.RateLimiter(rpm=rpm)
-    logger.info("Embed bắt đầu: batch=%d, concurrency=%d, rpm=%d (%.1f req/s)",
-                BATCH, concurrency, rpm, rpm / 60)
-
-    def _embed_one_batch(batch: list[TextUnit]) -> list[TextUnit]:
-        rate_limiter.acquire()  # chặn tại đây nếu đang gửi quá nhanh
-        to_embed = [tu for tu in batch if tu.accumulated_text.strip()]
-        no_text = [tu for tu in batch if not tu.accumulated_text.strip()]
-        for tu in no_text:
-            tu.error_log = "accumulated_text rỗng — bỏ qua embed"
-        if to_embed:
-            embeddings = gemini_embedding._embed_batch_with_retry(client, to_embed)
-            if embeddings is None:
-                error_msg = "Hết lần retry (429 quota) hoặc lỗi không retry được"
-                for tu in to_embed:
-                    tu.error_log = error_msg
-                gemini_embedding._write_embed_errors([tu.unit_id for tu in to_embed], error_msg)
-            else:
-                now = datetime.now(timezone.utc)
-                for tu, emb in zip(to_embed, embeddings):
-                    tu.embedding = list(emb.values)
-                    tu.embedded_at = now
-                    tu.error_log = None
-        return no_text + to_embed
+    BATCH = 250
+    logger.info("Embed → JSONL: batch=%d, concurrency=%d, rpm=%d", BATCH, concurrency, rpm)
 
     total = skipped = succeeded = failed = 0
     embed_batch: list[TextUnit] = []
@@ -175,9 +199,7 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
         if total % 50_000 < BATCH:
             logger.info("Embed: %d ghi xong (%d OK, %d lỗi)...", total, succeeded, failed)
 
-    # Nếu resume: append vào file hiện có; nếu lần đầu: tạo mới
     file_mode = "a" if done_ids else "w"
-
     with (
         open(in_path, "r", encoding="utf-8") as f_in,
         open(out_path, file_mode, encoding="utf-8") as f_out,
@@ -201,7 +223,7 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
                 if len(active_futures) >= concurrency:
                     _drain_one(f_out)
 
-        _submit()  # batch cuối
+        _submit()
         while active_futures:
             _drain_one(f_out)
 
@@ -210,6 +232,101 @@ def stage_embed(concurrency: int = 4, rpm: int = 60) -> None:
                     total, succeeded, failed, skipped, out_path)
     else:
         logger.info("Embed xong %d TextUnit (%d OK, %d lỗi) -> %s", total, succeeded, failed, out_path)
+
+
+def _stage_embed_direct(in_path: Path, concurrency: int, rpm: int) -> None:
+    """Mode --embed-direct: embed → upsert thẳng lên Neo4j, không ghi JSONL vector."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    from load import loaders
+    from load.neo4j_client import Neo4jClient
+
+    _, _, _embed_one_batch = _build_embed_loop(concurrency, rpm)
+    if _embed_one_batch is None:
+        return
+
+    BATCH = 250
+
+    with (
+        open(in_path, "r", encoding="utf-8") as f_in,
+        Neo4jClient() as neo4j,
+        ThreadPoolExecutor(max_workers=concurrency) as executor,
+    ):
+        # --- Resume: hỏi Neo4j unit_id nào đã có embedding ---
+        done_ids: set[str] = set()
+        try:
+            records = neo4j.query(
+                "MATCH (t:TextUnit) WHERE t.embedding IS NOT NULL RETURN t.unit_id AS unit_id"
+            )
+            done_ids = {r["unit_id"] for r in records}
+        except Exception:
+            logger.exception("Không query được Neo4j để kiểm tra resume — bắt đầu từ đầu.")
+
+        if done_ids:
+            logger.info("Resume (direct): %d TextUnit đã có embedding trong Neo4j — sẽ bỏ qua.", len(done_ids))
+        logger.info("Embed → Neo4j trực tiếp: batch=%d, concurrency=%d, rpm=%d", BATCH, concurrency, rpm)
+
+        total = skipped = succeeded = failed = 0
+        embed_batch: list[TextUnit] = []
+        active_futures: list[Future] = []
+
+        def _submit():
+            if embed_batch:
+                snapshot = list(embed_batch)
+                embed_batch.clear()
+                active_futures.append(executor.submit(_embed_one_batch, snapshot))
+
+        def _drain_one():
+            nonlocal total, succeeded, failed
+            fut = active_futures.pop(0)
+            batch_result = fut.result()
+            rows = [
+                {
+                    "unit_id": tu.unit_id,
+                    "embedding": tu.embedding,
+                    "embedded_at": tu.embedded_at.isoformat() if tu.embedded_at else None,
+                    "error_log": tu.error_log,
+                }
+                for tu in batch_result
+                if tu.type != "cache_action"  # cache_action: embedding luôn null, không upsert
+            ]
+            if rows:
+                loaders.upsert_textunit_embeddings(neo4j, rows)
+            for tu in batch_result:
+                total += 1
+                if tu.embedding is not None:
+                    succeeded += 1
+                elif tu.type != "cache_action" and tu.error_log:
+                    failed += 1
+            if total % 50_000 < BATCH:
+                logger.info("Embed direct: %d xong (%d OK, %d lỗi)...", total, succeeded, failed)
+
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            tu = TextUnit.model_validate_json(line)
+            if tu.unit_id in done_ids:
+                skipped += 1
+                continue
+            if tu.type == "cache_action":
+                total += 1
+                continue  # cache_action: embedding luôn null, không cần upsert
+            embed_batch.append(tu)
+            if len(embed_batch) >= BATCH:
+                _submit()
+                if len(active_futures) >= concurrency:
+                    _drain_one()
+
+        _submit()
+        while active_futures:
+            _drain_one()
+
+    if skipped:
+        logger.info("Embed direct xong %d TextUnit mới (%d OK, %d lỗi) + %d đã có sẵn.",
+                    total, succeeded, failed, skipped)
+    else:
+        logger.info("Embed direct xong %d TextUnit (%d OK, %d lỗi) → Neo4j.", total, succeeded, failed)
 
 
 def _read_load_artifacts():
@@ -327,6 +444,15 @@ def main() -> None:
             "Giảm xuống 30 nếu vẫn bị 429. Tăng lên 120-300 nếu quota cho phép."
         ),
     )
+    parser.add_argument(
+        "--embed-direct",
+        action="store_true",
+        help=(
+            "Upsert embedding thẳng lên Neo4j thay vì ghi ra JSONL.\n"
+            "Không tạo file EMBEDDED_DIR/textunits.jsonl — tiết kiệm ~17 GB disk.\n"
+            "Yêu cầu: --stage load đã chạy trước để TextUnit node tồn tại trong Neo4j."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -338,7 +464,7 @@ def main() -> None:
     if args.stage in ("transform", "all"):
         stage_transform(sample=args.sample, use_llm=use_llm, workers=args.workers, input_dir=args.input_dir)
     if args.stage in ("embed", "all"):
-        stage_embed(concurrency=args.embed_concurrency, rpm=args.embed_rpm)
+        stage_embed(concurrency=args.embed_concurrency, rpm=args.embed_rpm, direct_to_graph=args.embed_direct)
     if args.stage in ("load", "all"):
         stage_load(limit_aura=args.limit_aura)
 

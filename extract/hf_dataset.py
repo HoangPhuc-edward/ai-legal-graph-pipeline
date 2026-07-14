@@ -210,36 +210,34 @@ def search_by_keywords(
     keywords_path: Path = DEFAULT_KEYWORDS_PATH,
     limit: int | None = None,
     raw_dir: Path = RAW_DIR,
-    batch_size: int = 500,
+    batch_size: int = 2000,
 ) -> dict[int, dict]:
-    """Quét `content.parquet` THEO BATCH tìm `content_html` chứa 1 trong các từ khoá ở `keywords_path`.
+    """Quét `metadata.parquet` THEO BATCH tìm `title` chứa 1 trong các từ khoá ở `keywords_path`.
 
     Với mỗi văn bản khớp, gắn thêm `metadata` tương ứng (từ metadata.parquet) và
     `relationships` liên quan (từ relationships.parquet, doc_id hoặc other_doc_id
     trùng id khớp). `limit=None` -> quét full + lấy full quan hệ liên quan;
-    `limit=N` -> dừng quét content ngay khi đủ N văn bản khớp (quan hệ liên quan
-    của đúng N văn bản đó vẫn lấy full, vì đã tự giới hạn theo số văn bản).
+    `limit=N` -> dừng quét ngay khi đủ N văn bản khớp.
     """
     keywords = _load_keywords(keywords_path)
-    content_path = _ensure_local_table_path("content", raw_dir)
+    metadata_path = _ensure_local_table_path("metadata", raw_dir)
 
-    pf = pq.ParquetFile(content_path)
+    pf = pq.ParquetFile(metadata_path)
     matched: dict[int, dict] = {}
-    for batch in pf.iter_batches(batch_size=batch_size, columns=["id", "content_html"]):
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["id", "title"]):
         ids = batch.column("id").to_pylist()
-        htmls = batch.column("content_html").to_pylist()
-        for doc_id, html in zip(ids, htmls):
-            if html is None:
+        titles = batch.column("title").to_pylist()
+        for doc_id, title in zip(ids, titles):
+            if not title:
                 continue
-            low = html.lower()
-            if any(kw in low for kw in keywords):
-                matched[doc_id] = {"content_html": html}
+            if any(kw in title.lower() for kw in keywords):
+                matched[doc_id] = {"title": title}
                 if limit is not None and len(matched) >= limit:
                     break
         if limit is not None and len(matched) >= limit:
             break
 
-    logger.info("Khớp từ khoá %s: %d văn bản", keywords, len(matched))
+    logger.info("Khớp từ khoá (title) %s: %d văn bản", keywords, len(matched))
     if not matched:
         return matched
 
@@ -255,9 +253,9 @@ def filter_to_parquet(
     output_dir: Path = FILTERED_DIR,
     batch_size: int = 500,
 ) -> dict[str, int]:
-    """Lọc 3 file parquet theo từ khoá, ghi ra output_dir dưới dạng parquet.
+    """Lọc 3 file parquet theo từ khoá trong title, ghi ra output_dir dưới dạng parquet.
 
-    Bước 1: quét content.parquet theo batch → thu thập matched_ids
+    Bước 1: quét metadata.parquet.title theo batch → thu thập matched_ids
     Bước 2: lọc metadata.parquet → ghi output_dir/metadata.parquet
     Bước 3: lọc content.parquet   → ghi output_dir/content.parquet
     Bước 4: lọc relationships.parquet (doc_id HOẶC other_doc_id trong matched_ids)
@@ -269,22 +267,22 @@ def filter_to_parquet(
     keywords = _load_keywords(keywords_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Bước 1 — quét content → matched_ids
-    content_path = _ensure_local_table_path("content", raw_dir)
-    pf = pq.ParquetFile(content_path)
+    # Bước 1 — quét metadata.title → matched_ids (nhẹ hơn content.parquet, chính xác hơn)
+    meta_path = _ensure_local_table_path("metadata", raw_dir)
+    pf = pq.ParquetFile(meta_path)
     matched_ids: set[int] = set()
-    for batch in pf.iter_batches(batch_size=batch_size, columns=["id", "content_html"]):
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["id", "title"]):
         ids = batch.column("id").to_pylist()
-        htmls = batch.column("content_html").to_pylist()
-        for doc_id, html in zip(ids, htmls):
-            if html and any(kw in html.lower() for kw in keywords):
+        titles = batch.column("title").to_pylist()
+        for doc_id, title in zip(ids, titles):
+            if title and any(kw in title.lower() for kw in keywords):
                 matched_ids.add(doc_id)
                 if limit is not None and len(matched_ids) >= limit:
                     break
         if limit is not None and len(matched_ids) >= limit:
             break
 
-    logger.info("Khớp từ khoá %s: %d văn bản", keywords, len(matched_ids))
+    logger.info("Khớp từ khoá (title) %s: %d văn bản", keywords, len(matched_ids))
     if not matched_ids:
         logger.warning("Không có văn bản nào khớp từ khoá — không ghi file.")
         return {}

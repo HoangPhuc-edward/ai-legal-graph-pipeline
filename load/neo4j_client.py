@@ -44,6 +44,12 @@ class Neo4jClient:
         with self._driver.session() as session:
             return session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
 
+    def query(self, cypher: str, **params) -> list[dict]:
+        """Read-only query — trả về list[dict] của các record kết quả."""
+        with self._driver.session() as session:
+            result = session.run(cypher, **params)
+            return [dict(record) for record in result]
+
     def batch_write(self, cypher: str, rows: list[dict], batch_size: int = NEO4J_BATCH_SIZE) -> None:
         """Chạy `UNWIND $rows AS row ...` theo từng batch — pattern dùng chung
         cho mọi hàm load_* trong loaders.py, tránh viết lại boilerplate."""

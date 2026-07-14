@@ -303,6 +303,24 @@ def load_with_limit(
     logger.info("[--limit-aura] Load xong: %d node, %d edge (ngưỡng %d/%d)", final_nodes, final_edges, max_nodes, max_edges)
 
 
+def upsert_textunit_embeddings(client: Neo4jClient, rows: list[dict]) -> None:
+    """Upsert embedding lên TextUnit node đã tồn tại trong Neo4j.
+
+    rows: list of {"unit_id", "embedding", "embedded_at", "error_log"}
+    Dùng cho --embed-direct: embed stream xong batch nào ghi Neo4j ngay, không qua JSONL.
+    """
+    client.batch_write(
+        """
+        UNWIND $rows AS row
+        MATCH (t:TextUnit {unit_id: row.unit_id})
+        SET t.embedding   = row.embedding,
+            t.embedded_at = row.embedded_at,
+            t.error_log   = row.error_log
+        """,
+        rows,
+    )
+
+
 def load_relations(client: Neo4jClient, relations: list[NormRelation]) -> None:
     """Cạnh Tầng A: (Norm)-[:RELATION_TYPE]->(Norm) — nhãn cạnh động theo
     RelationType. Cypher không tham số hoá được relationship type, nhưng
