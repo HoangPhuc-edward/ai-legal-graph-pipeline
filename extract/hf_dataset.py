@@ -321,6 +321,7 @@ def filter_to_parquet(
     logger.info("metadata.parquet: %d dòng → %s", counts["metadata"], output_dir / "metadata.parquet")
 
     # Bước 3 — lọc content
+    content_path = _ensure_local_table_path("content", raw_dir)
     counts["content"] = _filter_and_write(content_path, output_dir / "content.parquet", ["id"])
     logger.info("content.parquet: %d dòng → %s", counts["content"], output_dir / "content.parquet")
 
