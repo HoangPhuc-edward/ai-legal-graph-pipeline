@@ -82,6 +82,177 @@ class TransformedDoc:
         }
 
 
+_MAX_TU_CHARS = 8_000
+
+
+def _split_long_line(line: str, max_chars: int) -> list[str]:
+    """Cắt 1 dòng đơn > max_chars thành các đoạn ≤ max_chars tại word boundary."""
+    if len(line) <= max_chars:
+        return [line]
+    parts = []
+    pos = 0
+    while pos < len(line):
+        end = pos + max_chars
+        if end >= len(line):
+            parts.append(line[pos:])
+            break
+        # Tìm khoảng trắng gần nhất để cắt sạch
+        cut = line.rfind(" ", pos, end)
+        if cut <= pos:
+            cut = end  # không tìm thấy space → cắt cứng
+        parts.append(line[pos:cut])
+        pos = cut + 1 if line[cut:cut+1] == " " else cut
+    return parts
+
+
+def _split_textunit(unit_id: str, text: str) -> list[tuple[str, str]]:
+    """Split oversized accumulated_text thành các phần ≤ _MAX_TU_CHARS.
+
+    Không bao giờ cắt giữa bảng prose ("Bảng [...]:" + data rows).
+    Nếu 1 bảng lớn hơn _MAX_TU_CHARS thì split theo data row, lặp lại
+    dòng "Bảng [...]:" ở đầu mỗi phần.
+    Context header "[...]" được lặp lại trong mỗi chunk.
+    """
+    if len(text) <= _MAX_TU_CHARS:
+        return [(unit_id, text)]
+
+    lines = text.split("\n")
+
+    # Tách context header (dòng đầu dạng "[Tên luật > Điều X > ...]")
+    header = ""
+    body_start = 0
+    if lines and lines[0].startswith("[") and lines[0].endswith("]"):
+        header = lines[0]
+        body_start = 1
+    body_lines = lines[body_start:]
+
+    # Parse body thành segments: ("table", table_header_line, [data_lines]) | ("para", [lines])
+    segments: list[tuple] = []
+    i = 0
+    while i < len(body_lines):
+        line = body_lines[i]
+        if line.startswith("Bảng ["):
+            table_header_line = line
+            i += 1
+            data_lines: list[str] = []
+            # Thu thập data rows — là các dòng có ": " sau tên cột (không phải "Bảng [")
+            while i < len(body_lines) and not body_lines[i].startswith("Bảng [") and not body_lines[i].startswith("["):
+                if body_lines[i].strip():
+                    data_lines.append(body_lines[i])
+                i += 1
+            segments.append(("table", table_header_line, data_lines))
+        else:
+            # Para block
+            para: list[str] = []
+            while i < len(body_lines) and not body_lines[i].startswith("Bảng ["):
+                para.append(body_lines[i])
+                i += 1
+            segments.append(("para", para))
+
+    # Pack segments vào chunks ≤ _MAX_TU_CHARS
+    chunks: list[str] = []
+    current: list[str] = [header] if header else []
+    current_len = len(header) + 1 if header else 0
+
+    def _flush():
+        nonlocal current, current_len
+        if current and (current != [header] if header else current):
+            chunks.append("\n".join(current))
+        current = [header] if header else []
+        current_len = len(header) + 1 if header else 0
+
+    for seg in segments:
+        if seg[0] == "para":
+            # Nếu có dòng đơn > _MAX_TU_CHARS (ví dụ HTML convert ra 1 dòng khổng lồ)
+            # → expand ra các sub-lines trước khi pack
+            para_lines_raw = seg[1]
+            para_lines: list[str] = []
+            header_overhead = len(header) + 1 if header else 0
+            line_max = max(500, _MAX_TU_CHARS - header_overhead)
+            for ln in para_lines_raw:
+                if len(ln) > line_max:
+                    para_lines.extend(_split_long_line(ln, line_max))
+                else:
+                    para_lines.append(ln)
+
+            for ln in para_lines:
+                ln_len = len(ln) + 1
+                if current_len + ln_len > _MAX_TU_CHARS and current != ([header] if header else []):
+                    _flush()
+                current.append(ln)
+                current_len += ln_len
+
+        else:  # "table"
+            _, tbl_header, data_lines = seg
+            tbl_header_len = len(tbl_header) + 1
+
+            if not data_lines:
+                # Empty table after prose conversion (shouldn't happen but be safe)
+                continue
+
+            full_table_lines = [tbl_header] + data_lines
+            full_table_text = "\n".join(full_table_lines)
+            full_table_len = len(full_table_text) + 1
+
+            # Cả bảng vừa trong 1 chunk
+            if current_len + full_table_len <= _MAX_TU_CHARS:
+                current.extend(full_table_lines)
+                current_len += full_table_len
+
+            # Bảng không vừa nhưng chunk hiện tại còn nội dung → flush trước
+            elif current != ([header] if header else []):
+                _flush()
+                # Thử thêm vào chunk mới
+                if tbl_header_len + full_table_len <= _MAX_TU_CHARS:
+                    current.extend(full_table_lines)
+                    current_len += full_table_len
+                else:
+                    # Bảng quá lớn → row-split
+                    _split_large_table(header, tbl_header, data_lines, chunks)
+
+            else:
+                # Chunk hiện tại trống, bảng vẫn quá lớn → row-split
+                _split_large_table(header, tbl_header, data_lines, chunks)
+
+    # Flush chunk cuối
+    if current and current != ([header] if header else []):
+        chunks.append("\n".join(current))
+
+    if not chunks:
+        return [(unit_id, text)]
+    if len(chunks) == 1:
+        return [(unit_id, chunks[0])]
+    return [(f"{unit_id}__p{i + 1}", chunk) for i, chunk in enumerate(chunks)]
+
+
+def _split_large_table(
+    ctx_header: str,
+    tbl_header: str,
+    data_lines: list[str],
+    chunks: list[str],
+) -> None:
+    """Row-split 1 bảng quá lớn, lặp lại ctx_header + tbl_header ở mỗi chunk."""
+    overhead = len(ctx_header) + 1 + len(tbl_header) + 1 if ctx_header else len(tbl_header) + 1
+    current: list[str] = [ctx_header, tbl_header] if ctx_header else [tbl_header]
+    current_len = overhead
+
+    row_max = max(500, _MAX_TU_CHARS - overhead)
+    for row in data_lines:
+        # Nếu 1 data row đơn vượt giới hạn → sub-split theo word boundary
+        sub_rows = _split_long_line(row, row_max) if len(row) > row_max else [row]
+        for sub in sub_rows:
+            sub_len = len(sub) + 1
+            if current_len + sub_len > _MAX_TU_CHARS and len(current) > (2 if ctx_header else 1):
+                chunks.append("\n".join(current))
+                current = [ctx_header, tbl_header] if ctx_header else [tbl_header]
+                current_len = overhead
+            current.append(sub)
+            current_len += sub_len
+
+    if len(current) > (2 if ctx_header else 1):
+        chunks.append("\n".join(current))
+
+
 def transform_one(metadata_row: dict, content_html: str) -> TransformedDoc:
     """1 hàng raw -> {Norm, [Component], [TextUnit]} — phần việc của Pass 1
     cho riêng 1 văn bản. Action/NormRelation xử lý ở Pass 2 vì cần
@@ -101,11 +272,14 @@ def transform_one(metadata_row: dict, content_html: str) -> TransformedDoc:
             continue
         ancestor_chain = build_ancestor_chain(leaf, components_by_id)
         accumulated_text = build_accumulated_text(norm, ancestor_chain, raw_text.strip())
-        unit_id = f"{comp_id}__tu"
-        text_units.append(
-            TextUnit(unit_id=unit_id, accumulated_text=accumulated_text, type="noi_dung", updated_at=now)
-        )
-        component_text_unit[comp_id] = unit_id
+        base_unit_id = f"{comp_id}__tu"
+        parts = [(base_unit_id, accumulated_text)]  # không chunk — giữ nguyên văn
+        for i, (part_unit_id, part_text) in enumerate(parts):
+            text_units.append(
+                TextUnit(unit_id=part_unit_id, accumulated_text=part_text, type="noi_dung", updated_at=now)
+            )
+            if i == 0:
+                component_text_unit[comp_id] = part_unit_id
 
     return TransformedDoc(
         norm=norm,

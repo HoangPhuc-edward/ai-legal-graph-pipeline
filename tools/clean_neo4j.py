@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 
 SCHEMA_INIT = Path(__file__).parent.parent / "load" / "schema_init.cypher"
-BATCH = 1000
+BATCH = 5000
 
 
 def _count_nodes(session) -> int:
