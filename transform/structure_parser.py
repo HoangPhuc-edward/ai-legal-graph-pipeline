@@ -172,7 +172,11 @@ def _match_level(line: str) -> Optional[tuple[ComponentLevel, re.Match]]:
 
 
 def _build_citation(level: ComponentLevel, match: re.Match) -> str:
-    identifier = match.groups()[-1].strip()
+    groups = match.groups()
+    identifier = groups[-1].strip()
+    # MUC pattern has 2 groups: ("Mục"|"Tiểu mục", number) — use matched keyword, not hardcoded label
+    if level == ComponentLevel.MUC:
+        return f"{groups[0]} {identifier}"
     return f"{_LEVEL_LABEL[level]} {identifier}"
 
 
@@ -219,6 +223,7 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     stack: list[_StackEntry] = [_StackEntry(comp_id="__ROOT__", level=None, rank=-1)]
     order_index = 0
     current_leaf_id = "__ROOT__"  # nơi nhận text không khớp level nào
+    preamble_lines: list[str] = []  # text trước Component đầu tiên
 
     for raw_line in markdown.splitlines():
         line = raw_line.rstrip("\n")
@@ -232,6 +237,8 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
                 result.raw_text[current_leaf_id] = (
                     result.raw_text.get(current_leaf_id, "") + line.strip() + "\n"
                 )
+            else:
+                preamble_lines.append(line.strip())
             continue
 
         level, m = matched
@@ -272,6 +279,15 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     result.raw_text = {
         comp_id: text for comp_id, text in result.raw_text.items() if comp_id not in parent_ids
     }
+
+    # Nội dung preamble (trước Component đầu tiên) → prepend vào leaf đầu tiên
+    if preamble_lines and result.raw_text:
+        preamble_text = "\n".join(preamble_lines) + "\n"
+        first_leaf_id = min(
+            result.raw_text,
+            key=lambda cid: next((c.order_index for c in result.components if c.comp_id == cid), 0),
+        )
+        result.raw_text[first_leaf_id] = preamble_text + result.raw_text[first_leaf_id]
 
     if not result.components:
         return _fallback_whole_document(norm_id, markdown, now)

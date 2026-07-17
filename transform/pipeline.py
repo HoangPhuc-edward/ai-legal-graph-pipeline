@@ -273,7 +273,7 @@ def transform_one(metadata_row: dict, content_html: str) -> TransformedDoc:
         ancestor_chain = build_ancestor_chain(leaf, components_by_id)
         accumulated_text = build_accumulated_text(norm, ancestor_chain, raw_text.strip())
         base_unit_id = f"{comp_id}__tu"
-        parts = [(base_unit_id, accumulated_text)]  # không chunk — giữ nguyên văn
+        parts = _split_textunit(base_unit_id, accumulated_text)
         for i, (part_unit_id, part_text) in enumerate(parts):
             text_units.append(
                 TextUnit(unit_id=part_unit_id, accumulated_text=part_text, type="noi_dung", updated_at=now)

@@ -13,7 +13,10 @@ def build_accumulated_text(
     norm: Norm, ancestor_chain: list[Component], leaf_text: str
 ) -> str:
     """ancestor_chain: danh sách Component từ gốc tới cha trực tiếp của lá (không gồm lá)."""
-    path = [norm.title] + [c.citation for c in ancestor_chain]
+    def _label(c: Component) -> str:
+        return f"{c.citation} {c.title_text}" if c.title_text else c.citation
+
+    path = [norm.title] + [_label(c) for c in ancestor_chain]
     context_header = " > ".join(path)
     return f"[{context_header}]\n{leaf_text}"
 
