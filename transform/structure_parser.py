@@ -14,9 +14,25 @@ from config import LEVEL_RANK
 from schema.enums import ComponentLevel
 from schema.nodes import Component
 
-# Thứ tự ưu tiên CỐ ĐỊNH — kiểm tra Phần trước, rồi Chương, Mục, Điều, Khoản, Điểm
-# (pattern hẹp hơn như "Điều" có thể match nhầm bên trong dòng "Chương").
+# Thứ tự ưu tiên CỐ ĐỊNH — PHU_LUC kiểm tra trước, rồi Phần, Chương, Mục, Điều, Khoản, Điểm.
+# PHU_LUC dùng named groups để _build_citation phân biệt "Phụ lục" vs "QUY ĐỊNH":
+#   (?P<pl_id>...) — định danh số thứ tự sau "Phụ lục" (I, II, số 1, ...)
+#   (?P<qd>QUY ĐỊNH) — nhận diện "QUY ĐỊNH ... kèm theo / đính kèm"
 LEVEL_PATTERNS: list[tuple[ComponentLevel, re.Pattern]] = [
+    # pl_id alternation (thứ tự ưu tiên quan trọng):
+    #   1. "[Ss]ố + space + roman/digit"  → "số I", "Số 1" (phải match đủ cả "số X")
+    #   2. Roman numeral                  → I, II, III, XXIV
+    #   3. Arabic digit                   → 1, 2, 10
+    #   4. Single uppercase letter + boundary → A, B, C (nhưng KHÔNG phải "S" từ "Số 1")
+    (ComponentLevel.PHU_LUC, re.compile(
+        r"^\s*(?:"
+        r"(?:Phụ\s+lục|PHỤ\s+LỤC)\s*"
+        r"(?P<pl_id>[Ss]ố\s+(?:[IVXLCDM]+|\d+)|[IVXLCDM]+|\d+|[A-ZĐ](?=\s|$))?"
+        r"|"
+        r"(?P<qd>QUY\s+ĐỊNH)\b[^\n]{0,120}(?:kèm\s+theo|đính\s+kèm)"
+        r")",
+        re.UNICODE,
+    )),
     (ComponentLevel.PHAN, re.compile(r"^\s*Phần\s+(thứ\s+)?([IVXLCDM\d]+)\b", re.IGNORECASE)),
     (ComponentLevel.CHUONG, re.compile(r"^\s*Chương\s+([IVXLCDM\d]+)\b", re.IGNORECASE)),
     (ComponentLevel.MUC, re.compile(r"^\s*(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE)),
@@ -26,6 +42,7 @@ LEVEL_PATTERNS: list[tuple[ComponentLevel, re.Pattern]] = [
 ]
 
 _LEVEL_LABEL = {
+    ComponentLevel.PHU_LUC: "Phụ lục",
     ComponentLevel.PHAN: "Phần",
     ComponentLevel.CHUONG: "Chương",
     ComponentLevel.MUC: "Mục",
@@ -42,6 +59,7 @@ _LEVEL_LABEL = {
 # (vd "2.000 - 3.000 đồng") — chỉ an toàn khi giới hạn trong phạm vi 1 Điều cụ
 # thể, để dành cho cải tiến sau (xem CLAUDE.md / README phần TODO).
 _FORCE_BREAK_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(?:Phụ\s+lục|PHỤ\s+LỤC)\b", re.UNICODE),
     re.compile(r"Phần\s+(thứ\s+)?([IVXLCDM\d]+)\b", re.IGNORECASE),
     re.compile(r"Chương\s+([IVXLCDM\d]+)\b", re.IGNORECASE),
     re.compile(r"(Mục|Tiểu mục)\s+(\d+)", re.IGNORECASE),
@@ -172,6 +190,13 @@ def _match_level(line: str) -> Optional[tuple[ComponentLevel, re.Match]]:
 
 
 def _build_citation(level: ComponentLevel, match: re.Match) -> str:
+    if level == ComponentLevel.PHU_LUC:
+        if match.group("qd") is not None:
+            return "Quy định kèm theo"
+        identifier = (match.group("pl_id") or "").strip()
+        # Normalize "số X" / "Số X" → "X" để citation nhất quán giữa các văn bản
+        identifier = re.sub(r"^[Ss]ố\s+", "", identifier).strip()
+        return f"Phụ lục {identifier}".strip() if identifier else "Phụ lục"
     groups = match.groups()
     identifier = groups[-1].strip()
     # MUC pattern has 2 groups: ("Mục"|"Tiểu mục", number) — use matched keyword, not hardcoded label
@@ -273,9 +298,26 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
         current_leaf_id = comp_id
 
     # Chỉ giữ raw_text cho Component LÁ THẬT (không phải cha của component nào
-    # khác) — nội dung của Component trung gian (vd Điều có Khoản con) đã được
-    # phản ánh đầy đủ ở các Component lá bên dưới, giữ lại sẽ trùng lặp.
+    # khác). Trước khi xóa: nếu parent có raw_text đáng kể (thường do toàn bộ
+    # nội dung Điều nằm trên 1 dòng HTML, "title_text" nuốt cả body), recover
+    # sang first child để không mất content — _split_textunit sẽ tự chia đúng size.
     parent_ids = {c.parent_comp_id for c in result.components if c.parent_comp_id is not None}
+    _MIN_PARENT_RECOVER = 100  # ngưỡng: bỏ qua title ngắn, chỉ recover khi thực sự là body
+    for c in result.components:
+        if c.comp_id not in parent_ids:
+            continue
+        parent_raw = result.raw_text.get(c.comp_id, "")
+        if len(parent_raw.strip()) <= _MIN_PARENT_RECOVER:
+            continue
+        children = sorted(
+            [x for x in result.components if x.parent_comp_id == c.comp_id],
+            key=lambda x: x.order_index,
+        )
+        if not children:
+            continue
+        first_child_id = children[0].comp_id
+        if first_child_id in result.raw_text:
+            result.raw_text[first_child_id] = parent_raw + result.raw_text[first_child_id]
     result.raw_text = {
         comp_id: text for comp_id, text in result.raw_text.items() if comp_id not in parent_ids
     }

@@ -142,32 +142,47 @@ def _stage_embed_jsonl(in_path: Path, concurrency: int, rpm: int) -> None:
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Resume: đọc output hiện có, giữ lại unit thành công, retry unit lỗi ---
+    # Stream-copy (không giữ toàn bộ file trong RAM) để tránh OOM khi file lớn.
     done_ids: set[str] = set()
     if out_path.exists():
-        successful_lines: list[str] = []
+        file_mb = out_path.stat().st_size / 1_048_576
+        logger.info(
+            "Resume: đang đọc file cũ (%.0f MB) — có thể mất vài phút nếu file lớn...",
+            file_mb,
+        )
+        print(f"Resume: đang đọc {out_path.name} ({file_mb:.0f} MB)...")
+        tmp_path = out_path.with_suffix(".tmp")
         retry_count = 0
-        with open(out_path, "r", encoding="utf-8") as f_check:
+        lines_read = 0
+        with (
+            open(out_path, "r", encoding="utf-8") as f_check,
+            open(tmp_path, "w", encoding="utf-8") as f_tmp,
+        ):
             for line in f_check:
                 line = line.strip()
                 if not line:
                     continue
+                lines_read += 1
+                if lines_read % 10_000 == 0:
+                    logger.info("Resume: đã đọc %d dòng (%d OK, %d lỗi)...", lines_read, len(done_ids), retry_count)
+                    print(f"  ... đã đọc {lines_read:,} dòng ({len(done_ids):,} OK, {retry_count:,} lỗi)")
                 try:
                     tu = TextUnit.model_validate_json(line)
                     if tu.embedding is not None or tu.type == "cache_action":
                         done_ids.add(tu.unit_id)
-                        successful_lines.append(line)
+                        f_tmp.write(line + "\n")
                     else:
                         retry_count += 1
                 except Exception:
                     pass
         if done_ids or retry_count:
-            with open(out_path, "w", encoding="utf-8") as f_rewrite:
-                for line in successful_lines:
-                    f_rewrite.write(line + "\n")
+            tmp_path.replace(out_path)  # atomic rename — tránh truncate giữa chừng
             logger.info(
                 "Resume: %d đã embed OK (giữ lại), %d lỗi (sẽ retry lại lần này).",
                 len(done_ids), retry_count,
             )
+        else:
+            tmp_path.unlink(missing_ok=True)
 
     _, _, _embed_one_batch = _build_embed_loop(concurrency, rpm)
     if _embed_one_batch is None:
@@ -399,60 +414,130 @@ def stage_load(limit_aura: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Vietnamese Legal GraphRAG ETL pipeline")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Vietnamese Legal Knowledge Graph — ETL pipeline\n"
+            "\n"
+            "Các stage (chạy theo thứ tự):\n"
+            "  extract    Download dataset từ HuggingFace → data/raw/*.parquet\n"
+            "  transform  HTML → Component tree + TextUnit → data/transformed/*.jsonl  (2-pass)\n"
+            "  embed      TextUnit → vector 768-dim (Gemini) → data/embedded/textunits.jsonl\n"
+            "             Có resume: unit đã embed OK sẽ bị bỏ qua, unit lỗi sẽ được retry.\n"
+            "  load       JSONL → Neo4j (MERGE — idempotent, an toàn chạy lại)\n"
+            "  all        Chạy cả 4 stage theo thứ tự trên\n"
+            "\n"
+            "Lưu ý dữ liệu file:\n"
+            "  transform ghi đè (mode 'w') — chạy lại sẽ xoá output cũ.\n"
+            "  embed có resume — chạy lại giữ unit đã embed, chỉ retry unit lỗi.\n"
+            "  load dùng MERGE — chạy lại không duplicate, nhưng không xoá node cũ trong Neo4j."
+        ),
+        epilog=(
+            "Ví dụ lệnh thường dùng:\n"
+            "\n"
+            "  # Kiểm tra môi trường trước khi chạy\n"
+            "  python tools/health_check.py --skip-llm\n"
+            "\n"
+            "  # Test nhanh transform (bắt buộc --sample khi debug)\n"
+            "  python run_pipeline.py --stage transform --sample 200 --no-llm\n"
+            "\n"
+            "  # Transform full corpus, 4 worker (Colab/server)\n"
+            "  python run_pipeline.py --stage transform --workers 4\n"
+            "\n"
+            "  # Embed — tiết kiệm disk, upsert thẳng Neo4j (cần load chạy trước)\n"
+            "  python run_pipeline.py --stage embed --embed-direct\n"
+            "\n"
+            "  # Embed — giảm tốc độ nếu bị 429 quota\n"
+            "  python run_pipeline.py --stage embed --embed-rpm 30 --embed-concurrency 1\n"
+            "\n"
+            "  # Load lên AuraDB Free (giới hạn 200k node / 400k edge)\n"
+            "  python run_pipeline.py --stage load --limit-aura\n"
+            "\n"
+            "  # Chạy toàn bộ pipeline từ đầu\n"
+            "  python run_pipeline.py --stage all --workers 4 --embed-rpm 120\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # ── Core ──────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--stage",
         required=True,
         choices=["extract", "transform", "embed", "load", "all"],
+        metavar="{extract,transform,embed,load,all}",
+        help="Stage cần chạy (bắt buộc). Xem mô tả phía trên.",
     )
-    parser.add_argument("--sample", type=int, default=None, help="Giới hạn số văn bản (transform stage)")
-    parser.add_argument(
+
+    # ── Transform ─────────────────────────────────────────────────────────────
+    g_tr = parser.add_argument_group("Transform  (--stage transform / all)")
+    g_tr.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Giới hạn N văn bản đầu tiên — BẮT BUỘC khi debug để tránh xử lý full corpus.",
+    )
+    g_tr.add_argument(
         "--no-llm",
         action="store_true",
-        help="Tắt LLM fallback ở action_extractor (chỉ dùng regex Tầng B)",
+        help="Tắt LLM call ở Pass 2 action_extractor, chỉ dùng regex. Nhanh hơn, không tốn API.",
     )
-    parser.add_argument(
+    g_tr.add_argument(
         "--workers",
         type=int,
         default=1,
-        help="Số process song song cho Pass 1 transform (mặc định 1 — an toàn cho laptop; Colab dùng 4)",
+        metavar="N",
+        help="Số process song song cho Pass 1 (mặc định: 1).\n"
+             "Laptop: giữ 1. Colab/server: 4 là hợp lý.",
     )
-    parser.add_argument(
-        "--limit-aura",
-        action="store_true",
-        help="Giới hạn load không vượt 200k node / 400k edge (AuraDB Free)",
-    )
-    parser.add_argument(
+    g_tr.add_argument(
         "--input-dir",
         type=Path,
         default=None,
-        help="Thư mục parquet input cho transform (mặc định: data/raw/). Dùng data/filtered/ sau khi chạy keyword filter.",
+        metavar="DIR",
+        help="Thư mục chứa *.parquet input (mặc định: data/raw/).\n"
+             "Dùng data/filtered/ nếu đã chạy keyword filter trước.",
     )
-    parser.add_argument(
+
+    # ── Embed ─────────────────────────────────────────────────────────────────
+    g_em = parser.add_argument_group(
+        "Embed  (--stage embed / all)",
+        "Vertex AI Gemini embedding-001, batch 250 TextUnit/request.\n"
+        "Resume tự động: unit đã embed OK sẽ bị bỏ qua khi chạy lại.",
+    )
+    g_em.add_argument(
         "--embed-concurrency",
         type=int,
         default=4,
-        help="Số API request embed song song (mặc định 4). Giảm xuống 1 nếu bị 429 liên tục.",
+        metavar="N",
+        help="Số request gửi song song (mặc định: 4).\n"
+             "Giảm xuống 1 nếu vẫn bị 429 dù đã giảm --embed-rpm.",
     )
-    parser.add_argument(
+    g_em.add_argument(
         "--embed-rpm",
         type=int,
         default=60,
-        help=(
-            "Giới hạn requests/phút gửi tới Vertex AI embedding (mặc định 60).\n"
-            "60 RPM × 250 batch = 15k TextUnit/phút = 900k/hr.\n"
-            "Giảm xuống 30 nếu vẫn bị 429. Tăng lên 120-300 nếu quota cho phép."
-        ),
+        metavar="N",
+        help="Requests/phút tối đa gửi tới Vertex AI (mặc định: 60).\n"
+             "60 RPM × 250 batch ≈ 15k TextUnit/phút ≈ 900k/giờ.\n"
+             "Giảm xuống 30 nếu bị 429. Tăng lên 120–300 nếu quota cho phép.",
     )
-    parser.add_argument(
+    g_em.add_argument(
         "--embed-direct",
         action="store_true",
-        help=(
-            "Upsert embedding thẳng lên Neo4j thay vì ghi ra JSONL.\n"
-            "Không tạo file EMBEDDED_DIR/textunits.jsonl — tiết kiệm ~17 GB disk.\n"
-            "Yêu cầu: --stage load đã chạy trước để TextUnit node tồn tại trong Neo4j."
-        ),
+        help="Upsert embedding thẳng lên Neo4j, không ghi file JSONL.\n"
+             "Tiết kiệm ~17 GB disk (mỗi vector 768 float32 × 100k TextUnit).\n"
+             "Yêu cầu: --stage load đã chạy trước để TextUnit node tồn tại trong Neo4j.",
     )
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+    g_ld = parser.add_argument_group("Load  (--stage load / all)")
+    g_ld.add_argument(
+        "--limit-aura",
+        action="store_true",
+        help="Bật guard AuraDB Free: dừng trước khi vượt 200k node / 400k edge.\n"
+             "Không cần flag này nếu dùng Neo4j Desktop hoặc AuraDB trả phí.",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

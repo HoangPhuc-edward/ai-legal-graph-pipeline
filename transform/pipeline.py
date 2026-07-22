@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ from typing import Optional
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from config import TRANSFORMED_DIR
+from config import LEVEL_RANK, TRANSFORMED_DIR
 from schema.edges import NormRelation
 from schema.enums import ComponentLevel
 from schema.nodes import Action, Component, Norm, TextUnit
@@ -43,6 +44,282 @@ from transform.structure_parser import parse_structure
 from transform.text_accumulator import build_accumulated_text, build_ancestor_chain
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Dedup & Validation ────────────────────────────────────────────────────────
+
+def _raw_text_score(text: str) -> float:
+    """Điểm chất lượng raw_text — dùng để chọn giữa 2 Component trùng citation.
+
+    Ưu tiên (giảm dần):
+    1. Text không bắt đầu bằng "Bảng [" (table metadata noise) — hệ số 1.0
+    2. Text dài hơn (nhiều nội dung hơn)
+    Text bắt đầu "Bảng [" bị phạt ×0.1 — chỉ giữ khi không có lựa chọn nào khác.
+    """
+    if not text:
+        return 0.0
+    # "Bảng [" = preamble bị nuốt vào table header → luôn thua plain text dù dài hơn.
+    # Hệ số 0.001 đảm bảo plain text 1 char (score=1) > table text 999 char (score=0.999).
+    return len(text) * (0.001 if text.startswith("Bảng [") else 1.0)
+
+
+def _dedup_components(
+    components: list[Component],
+    raw_text: Optional[dict[str, str]] = None,
+) -> list[Component]:
+    """Loại bỏ Component trùng (parent_comp_id, citation) — best-quality-wins.
+
+    Khi raw_text được cung cấp: giữ Component có raw_text chất lượng cao nhất
+    (không phải table metadata, và dài hơn). Khi không có raw_text: first-wins.
+
+    Cascade: nếu một Component bị loại, tất cả con/cháu cũng bị loại theo.
+    Điều này xử lý HTML triplication mà không xoá Phụ lục hợp lệ (Phụ lục
+    đã có ComponentLevel.PHU_LUC làm parent riêng).
+
+    Giả định: components sắp xếp theo order_index tăng dần.
+    """
+    # Pass 1: tìm winner cho mỗi (parent, citation) key
+    winner: dict[tuple, str] = {}  # key → comp_id của winner
+    winner_score: dict[tuple, float] = {}
+
+    for c in components:
+        key = (c.parent_comp_id, c.citation)
+        if raw_text is not None:
+            score = _raw_text_score(raw_text.get(c.comp_id, ""))
+        else:
+            score = 1.0 if key not in winner else -1.0  # first-wins khi không có text
+
+        if key not in winner or score > winner_score[key]:
+            winner[key] = c.comp_id
+            winner_score[key] = score
+
+    winner_ids = set(winner.values())
+
+    # Pass 2: cascade — loại comp trùng + tất cả con/cháu của chúng
+    dropped: set[str] = set()
+    result: list[Component] = []
+
+    for c in components:
+        if c.parent_comp_id in dropped:
+            dropped.add(c.comp_id)
+            continue
+        key = (c.parent_comp_id, c.citation)
+        if c.comp_id != winner.get(key):
+            dropped.add(c.comp_id)
+        else:
+            result.append(c)
+
+    if dropped:
+        logger.debug("_dedup_components: loại %d Component trùng", len(dropped))
+    return result
+
+
+def _remove_triplication_ghosts(components: list[Component]) -> list[Component]:
+    """Pass 3 sau dedup: loại ghost DIEUs từ HTML triplication còn sót.
+
+    Symptom: parent P có dãy DIEU [44, 45, ..., 52, 1, 2, 3, 4] — số giảm đột ngột.
+    Nguyên nhân: copy 2/3 của HTML xuất hiện khi stack đang có P (thường là Chương cuối),
+    làm preamble DIEUs của copy 2 bị gắn vào P thay vì ROOT. Dedup không bắt được
+    vì (P_id, "Điều 1") ≠ (None, "Điều 1").
+
+    Heuristic: tail DIEU (sau điểm reset số) có citation đã tồn tại dưới parent NÔNG hơn
+    (gần ROOT hơn trong hierarchy) → ghost → drop + cascade children.
+
+    Không xử lý trường hợp PHU_LUC có Điều riêng: PHU_LUC rank=0 (cùng level với Phan),
+    nên parent_depth(DIEU trong PHU_LUC) = 0 và DIEU của thân văn bản (dưới ROOT) = -1.
+    Nghĩa là DIEU trong PHU_LUC SAU hơn so với DIEU ở ROOT → thuật toán sẽ drop chúng
+    nếu có reset... trừ khi bản thân PHU_LUC cũng tạo ra reset (vì PHU_LUC là parent riêng,
+    DIEU của PHU_LUC và DIEU của thân không share cùng parent group → không có reset trong
+    group đó → không bị xử lý ở đây). An toàn.
+    """
+    import re as _re
+    _dieu_num = _re.compile(r"Điều\s+(\d+)", _re.IGNORECASE)
+
+    comp_by_id = {c.comp_id: c for c in components}
+
+    def _parent_depth(c: Component) -> int:
+        """Depth của parent trong hierarchy (-1=ROOT, 0=PhuLuc/Phan, 1=Chuong, ...)."""
+        if c.parent_comp_id is None:
+            return -1
+        p = comp_by_id.get(c.parent_comp_id)
+        return LEVEL_RANK.get(p.level.value, 99) if p else 99
+
+    # Index: citation → [(depth, comp_id)] chỉ cho DIEU
+    dieu_by_citation: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for c in components:
+        if c.level == ComponentLevel.DIEU:
+            dieu_by_citation[c.citation].append((_parent_depth(c), c.comp_id))
+
+    # Nhóm siblings theo parent
+    siblings: dict[Optional[str], list[Component]] = defaultdict(list)
+    for c in components:
+        siblings[c.parent_comp_id].append(c)
+
+    to_drop: set[str] = set()
+
+    for parent_id, sibs in siblings.items():
+        dieu_sibs = [c for c in sibs if c.level == ComponentLevel.DIEU]
+        if len(dieu_sibs) < 2:
+            continue
+
+        # Tìm điểm reset (số giảm lần đầu tiên)
+        prev_num = None
+        reset_idx: Optional[int] = None
+        for i, c in enumerate(dieu_sibs):
+            m = _dieu_num.search(c.citation)
+            num = int(m.group(1)) if m else -1
+            if prev_num is not None and num >= 0 and prev_num >= 0 and num < prev_num:
+                reset_idx = i
+                break
+            if num >= 0:
+                prev_num = num
+
+        if reset_idx is None:
+            continue
+
+        # Tail = từ điểm reset — check từng ghost
+        for ghost_c in dieu_sibs[reset_idx:]:
+            this_depth = _parent_depth(ghost_c)
+            has_shallower = any(
+                d < this_depth
+                for d, cid in dieu_by_citation.get(ghost_c.citation, [])
+                if cid != ghost_c.comp_id
+            )
+            if has_shallower:
+                to_drop.add(ghost_c.comp_id)
+
+    if not to_drop:
+        return components
+
+    # Cascade: drop ghost + tất cả con/cháu
+    dropped: set[str] = set(to_drop)
+    result: list[Component] = []
+    for c in components:
+        if c.parent_comp_id in dropped:
+            dropped.add(c.comp_id)
+        elif c.comp_id not in dropped:
+            result.append(c)
+
+    logger.debug("_remove_triplication_ghosts: dropped %d ghost components", len(dropped))
+    return result
+
+
+@dataclass
+class StructureIssue:
+    norm_id: str
+    issue_type: str   # "dup_citation" | "broken_parent" | "orphan_text"
+    severity: str     # "warn" | "error"
+    message: str
+    details: dict
+
+
+def validate_parse_result(norm_id: str, result) -> list[StructureIssue]:
+    """Kiểm tra tính nhất quán của ParseResult SAU khi dedup.
+
+    Sau dedup không nên còn lỗi — nếu vẫn còn là dấu hiệu parse sai cấu trúc
+    thực sự (không phải HTML triplication đơn giản). Caller có thể dùng danh
+    sách này để quyết định có cần LLM fallback hay không.
+    """
+    issues: list[StructureIssue] = []
+    components_by_id = {c.comp_id: c for c in result.components}
+
+    # 1. Duplicate (parent_comp_id, citation) còn sót sau dedup
+    citation_groups: dict[tuple, list[str]] = defaultdict(list)
+    for c in result.components:
+        citation_groups[(c.parent_comp_id, c.citation)].append(c.comp_id)
+    for (parent_id, citation), comp_ids in citation_groups.items():
+        if len(comp_ids) > 1:
+            issues.append(StructureIssue(
+                norm_id=norm_id,
+                issue_type="dup_citation",
+                severity="warn",
+                message=(
+                    f"Citation {citation!r} vẫn trùng {len(comp_ids)}× "
+                    f"dưới parent={parent_id} — nội dung khác nhau, không dedup được"
+                ),
+                details={"parent_id": parent_id, "citation": citation, "comp_ids": comp_ids},
+            ))
+
+    # 2. Parent reference trỏ đến comp_id không tồn tại
+    for c in result.components:
+        if c.parent_comp_id and c.parent_comp_id not in components_by_id:
+            issues.append(StructureIssue(
+                norm_id=norm_id,
+                issue_type="broken_parent",
+                severity="error",
+                message=f"Component {c.comp_id} trỏ đến parent {c.parent_comp_id} không tồn tại",
+                details={"comp_id": c.comp_id, "missing_parent": c.parent_comp_id},
+            ))
+
+    # 3. raw_text gắn vào comp_id không có trong components_by_id
+    for comp_id in result.raw_text:
+        if comp_id not in components_by_id:
+            issues.append(StructureIssue(
+                norm_id=norm_id,
+                issue_type="orphan_text",
+                severity="error",
+                message=f"raw_text gắn vào comp_id {comp_id!r} không tồn tại trong components",
+                details={"comp_id": comp_id},
+            ))
+
+    # 4. Non-monotonic DIEU sequence trong cùng parent (dấu hiệu HTML triplication ghost)
+    # Điều số giảm trong cùng group → likely copy N của tài liệu bị gắn nhầm parent.
+    import re as _re
+    _dieu_num_pat = _re.compile(r"Điều\s+(\d+)", _re.IGNORECASE)
+    siblings_by_parent: dict[Optional[str], list] = defaultdict(list)
+    for c in result.components:
+        siblings_by_parent[c.parent_comp_id].append(c)
+
+    for parent_id, sibs in siblings_by_parent.items():
+        dieu_sibs = [c for c in sibs if c.level == ComponentLevel.DIEU]
+        if len(dieu_sibs) < 2:
+            continue
+        prev_num = None
+        for c in dieu_sibs:
+            m = _dieu_num_pat.search(c.citation)
+            if not m:
+                continue
+            num = int(m.group(1))
+            if prev_num is not None and num < prev_num:
+                parent_comp = components_by_id.get(parent_id or "")
+                parent_cit = parent_comp.citation if parent_comp else "ROOT"
+                issues.append(StructureIssue(
+                    norm_id=norm_id,
+                    issue_type="ghost_citation",
+                    severity="warn",
+                    message=(
+                        f"Điều số GIẢM trong {parent_cit}: {prev_num} → {num} "
+                        f"(likely HTML triplication ghost dưới sai parent)"
+                    ),
+                    details={"parent_id": parent_id, "prev_num": prev_num, "curr_num": num},
+                ))
+                break  # 1 issue/parent group là đủ
+            prev_num = num
+
+    return issues
+
+
+def _log_issues(norm_id: str, issues: list[StructureIssue]) -> None:
+    """Log issues và đánh dấu cases cần LLM review."""
+    if not issues:
+        return
+    dup_count = sum(1 for i in issues if i.issue_type == "dup_citation")
+    error_count = sum(1 for i in issues if i.severity == "error")
+    logger.warning(
+        "Norm %s — %d issue(s): %d dup_citation, %d error",
+        norm_id, len(issues), dup_count, error_count,
+    )
+    for issue in issues:
+        fn = logger.error if issue.severity == "error" else logger.warning
+        fn("  [%s/%s] %s", norm_id, issue.issue_type, issue.message)
+    if dup_count > 0:
+        # TODO: LLM fallback — gọi LLM để xác định Component nào là canonical
+        # khi 2 Component có cùng (parent, citation) nhưng text khác nhau.
+        # Đây là trường hợp phức tạp mà dedup không thể tự giải quyết.
+        logger.warning(
+            "  [%s] LLM fallback CHƯA IMPLEMENT — %d dup_citation cần review thủ công",
+            norm_id, dup_count,
+        )
 
 
 def _norm_from_metadata_row(row: dict) -> Norm:
@@ -260,6 +537,18 @@ def transform_one(metadata_row: dict, content_html: str) -> TransformedDoc:
     norm = _norm_from_metadata_row(metadata_row)
     markdown = html_to_markdown(content_html or "")
     parse_result = parse_structure(norm.norm_id, markdown)
+
+    # Pass 1: Dedup (parent, citation) trùng — HTML triplication phổ biến.
+    # Truyền raw_text để chọn Component có nội dung tốt hơn (không phải table noise).
+    parse_result.components = _dedup_components(parse_result.components, parse_result.raw_text)
+    # Pass 2: Loại ghost DIEUs từ triplication còn sót sau dedup (khác parent).
+    parse_result.components = _remove_triplication_ghosts(parse_result.components)
+    kept_ids = {c.comp_id for c in parse_result.components}
+    parse_result.raw_text = {k: v for k, v in parse_result.raw_text.items() if k in kept_ids}
+
+    # Validate sau dedup — log warning/error nếu vẫn còn bất thường
+    issues = validate_parse_result(norm.norm_id, parse_result)
+    _log_issues(norm.norm_id, issues)
 
     components_by_id = {c.comp_id: c for c in parse_result.components}
     text_units: list[TextUnit] = []
@@ -501,15 +790,17 @@ def run(
             processed_ids: set[str] = set()
             idx = 0
             # Stream content 200 rows tại một thời điểm — không bao giờ to_pylist() toàn bộ
+            # processed_ids dedup: content source có exact duplicate rows → bỏ qua lần 2+
             for batch in content_filtered.to_batches(max_chunksize=CONTENT_BATCH):
                 batch_rows = batch.to_pylist()
-                batch_pairs = [
-                    (meta_by_id[str(r["id"])], r["content_html"] or "")
-                    for r in batch_rows
-                    if str(r["id"]) in meta_by_id
-                ]
+                batch_pairs = []
                 for r in batch_rows:
-                    processed_ids.add(str(r["id"]))
+                    doc_id = str(r["id"])
+                    if doc_id in processed_ids:
+                        continue
+                    processed_ids.add(doc_id)
+                    if doc_id in meta_by_id:
+                        batch_pairs.append((meta_by_id[doc_id], r["content_html"] or ""))
                 if batch_pairs:
                     _process_and_stream(_transform_batch(batch_pairs), f_norms, f_comps, f_tu)
                     idx += len(batch_pairs)

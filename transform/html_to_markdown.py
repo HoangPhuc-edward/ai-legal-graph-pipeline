@@ -13,11 +13,15 @@ Xử lý bảng:
 """
 from __future__ import annotations
 
+import logging
 import re
 from itertools import zip_longest
+from typing import Optional
 
 from bs4 import BeautifulSoup
 from fast_html2md import HTMLToMarkdown
+
+logger = logging.getLogger(__name__)
 
 _converter = HTMLToMarkdown()
 
@@ -112,8 +116,17 @@ def _expand_table_to_grid(table_tag) -> list[list[str]]:
         else:
             break  # chưa gặp header cha → bảng đơn tầng
 
-    # Fallback: không có multi-level header, hoặc tất cả rows là header (bảng kỳ lạ)
-    if n_header == 0 or n_header >= max_r:
+    # n_header == 0: không tìm thấy multi-level header (bảng đơn tầng — thường gặp khi
+    # bảng chỉ có rowspan trên data cells, header bình thường không colspan).
+    # Không cần LLM — chỉ cần treat row 0 là header.
+    if n_header == 0:
+        if max_r >= 2:
+            n_header = 1  # row 0 = header đơn tầng, tiếp tục xử lý bình thường
+        else:
+            return [[cells.get((0, c), "") for c in range(max_c)]]  # 1 hàng duy nhất
+
+    # n_header >= max_r: mọi hàng đều có colspan > 1 → bảng ambiguous, dùng flat grid
+    if n_header >= max_r:
         return [
             [cells.get((r, c), "") for c in range(max_c)]
             for r in range(max_r)

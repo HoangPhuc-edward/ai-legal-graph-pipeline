@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class ComponentLevel(str, Enum):
+    PHU_LUC = "PhuLuc"   # Phụ lục / QUY ĐỊNH kèm theo — ngang cấp PHAN
     PHAN = "Phan"
     CHUONG = "Chuong"
     MUC = "Muc"

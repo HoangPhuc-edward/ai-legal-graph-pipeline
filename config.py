@@ -34,6 +34,7 @@ for _dir in (RAW_DIR, FILTERED_DIR, TRANSFORMED_DIR, EMBEDDED_DIR):
 
 # --- Bảng rank cấp văn bản (Component) — số nhỏ hơn = cấp cao hơn (nông hơn trong cây) ---
 LEVEL_RANK = {
+    "PhuLuc": 0,   # ngang cấp Phan — cả hai là con trực tiếp của Norm (gốc)
     "Phan": 0,
     "Chuong": 1,
     "Muc": 2,

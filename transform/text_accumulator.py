@@ -14,7 +14,13 @@ def build_accumulated_text(
 ) -> str:
     """ancestor_chain: danh sách Component từ gốc tới cha trực tiếp của lá (không gồm lá)."""
     def _label(c: Component) -> str:
-        return f"{c.citation} {c.title_text}" if c.title_text else c.citation
+        if not c.title_text:
+            return c.citation
+        t = c.title_text.strip()
+        # title_text có thể rất dài (ví dụ: toàn bộ nội dung Phụ lục trên 1 dòng).
+        # Chỉ dùng tối đa 120 ký tự đầu cho path — đủ để phân biệt section, không làm phình context header.
+        short = (t[:120] + "…") if len(t) > 120 else t
+        return f"{c.citation} {short}"
 
     path = [norm.title] + [_label(c) for c in ancestor_chain]
     context_header = " > ".join(path)

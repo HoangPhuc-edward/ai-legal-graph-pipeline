@@ -68,6 +68,32 @@ python tools/clean_neo4j.py --force  # xoá không hỏi
 Mỗi stage đọc/ghi qua file trung gian dưới `./data/` (`raw/`, `transformed/`, `embedded/`)
 để có thể dừng/chạy lại từng giai đoạn riêng — quan trọng vì `embed` tốn phí.
 
+### Xoá sạch đồ thị (`tools/clean_neo4j.py`)
+
+Dùng khi muốn **reload từ đầu** (thay đổi schema, re-transform toàn bộ, hoặc môi trường dev).
+
+```bash
+python tools/clean_neo4j.py          # in số node/edge hiện tại, hỏi "yes" trước khi xoá
+python tools/clean_neo4j.py --force  # xoá không hỏi (dùng trong script/Colab)
+```
+
+**Những gì script làm:**
+1. Đếm và hiển thị số node/edge hiện có.
+2. Xoá toàn bộ node + edge theo batch 5,000 — tránh AuraDB timeout (không dùng `DETACH DELETE` trực tiếp
+   vì với 200k+ node AuraDB sẽ timeout).
+3. Recreate schema từ `load/schema_init.cypher` — gồm 4 unique constraint, 2 index thường,
+   và 1 vector index `textunit_embedding_index` (768-dim, cosine).
+
+**Sau khi clean, chạy lại từ load:**
+```bash
+python run_pipeline.py --stage load   # load lại từ data/embedded/textunits.jsonl đã có
+```
+Không cần re-transform hay re-embed — file `data/embedded/textunits.jsonl` vẫn còn nguyên.
+
+**Lưu ý vector index:** `clean_neo4j.py` recreate lại vector index ngay sau xoá, nhưng Neo4j
+cần thời gian populate (vài phút với corpus lớn) sau khi `--stage load` nạp xong embedding.
+Chạy `pytest tests/test_neo4j_rag_quality.py -v -m critical` để xác nhận index sẵn sàng.
+
 ### Tra cứu dữ liệu thô an toàn (`extract/hf_dataset.py`)
 
 Đọc parquet **theo batch** (không bao giờ load full file — xem [`CLAUDE.md`](CLAUDE.md) Mục 1).
