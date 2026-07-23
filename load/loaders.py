@@ -21,9 +21,13 @@ việc tạo cạnh HAS_ACTION/APPLY_TO — cùng 1 transaction logic.
 from __future__ import annotations
 
 import logging
+import re
 
 from schema.edges import NormRelation
 from schema.nodes import Action, Component, Norm, TextUnit
+
+# Nhận diện TextUnit part: "{comp_id}__tu__p{N}" (N >= 2) — sinh từ _split_textunit
+_TU_PART_PAT = re.compile(r"^(.+)__tu__p\d+$")
 
 from .neo4j_client import Neo4jClient
 
@@ -121,11 +125,16 @@ def load_component_textunits(
     client.batch_write(node_cypher, rows)
 
     unit_to_comp = {unit_id: comp_id for comp_id, unit_id in component_owner_map.items()}
-    edges = [
-        {"owner_id": unit_to_comp[tu.unit_id], "unit_id": tu.unit_id}
-        for tu in text_units
-        if tu.unit_id in unit_to_comp
-    ]
+    edges = []
+    for tu in text_units:
+        if tu.unit_id in unit_to_comp:
+            edges.append({"owner_id": unit_to_comp[tu.unit_id], "unit_id": tu.unit_id})
+        else:
+            # Part __p2, __p3,... được tách từ cùng Component với __p1
+            # comp_id = phần trước "__tu__p{N}" trong unit_id
+            m = _TU_PART_PAT.match(tu.unit_id)
+            if m and m.group(1) in component_owner_map:
+                edges.append({"owner_id": m.group(1), "unit_id": tu.unit_id})
     edge_cypher = """
     UNWIND $rows AS row
     MATCH (c:Component {comp_id: row.owner_id})

@@ -75,6 +75,18 @@ _FORCE_BREAK_PATTERNS: list[re.Pattern] = [
 _KHOAN_AT_START = re.compile(r"^\s*\d{1,2}\.\s+")
 _DIEM_AT_START = re.compile(r"^\s*[a-zđ]\)\s+")
 
+# Từ dẫn trích dẫn — nếu prefix kết thúc bằng một trong các từ này thì marker
+# phía sau là citation (trích dẫn), KHÔNG phải structural header.
+# Ví dụ: "theo quy định tại Điều 5" → "tại " ở cuối prefix → không tách.
+_CITATION_LEADERS = re.compile(
+    r"(?:tại|theo|trong|của|nêu\s+tại|quy\s+định|căn\s+cứ|đề\s+cập|"
+    r"khoản\s+\d+(?:\s+[a-zđ]\))?)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+# Ranh giới câu ngay trước marker → marker là structural (khởi đầu câu mới).
+# Ví dụ: "...Nhà nước. Điều 2." → "." trước "Điều" → tách.
+_SENTENCE_END = re.compile(r"[.;:]\s*$")
+
 
 def _split_line_at_headers(line: str) -> list[str]:
     """Tách 1 dòng thành nhiều dòng nếu có marker cấp (Phần/Chương/Mục/Điều) bị
@@ -84,10 +96,15 @@ def _split_line_at_headers(line: str) -> list[str]:
       A) marker bị dính SAU nội dung (m.start() > 0): tách TRƯỚC marker.
          Thu thập TẤT CẢ điểm split trong 1 lần scan qua 5 pattern — tách đồng
          loạt thay vì while-loop cũ chỉ tách 1 điểm mỗi vòng (O(N²) → O(N)).
+         Tách trừ khi có từ dẫn trích dẫn ngay trước marker (tại/theo/trong/...).
       B) marker ở ĐẦU dòng nhưng trailing là Khoản/Điểm: tách SAU marker.
          Chỉ áp dụng khi không có case A nào (ưu tiên A > B).
          Ví dụ: 'Điều 2. 1. Thu ngân sách...' -> ['Điều 2.', '1. Thu ngân sách...']
          Không tách: 'Điều 1. Phạm vi điều chỉnh' (trailing là title_text hợp lệ).
+
+    Quy tắc ngữ cảnh cho Case A:
+      Từ dẫn trích dẫn (tại/theo/trong/quy định/...) → citation, KHÔNG tách.
+      Mọi trường hợp khác → tách (giữ hành vi gốc, bổ sung bảo vệ citation).
     """
     split_points: set[int] = set()
     case_b_split: Optional[int] = None
@@ -100,8 +117,10 @@ def _split_line_at_headers(line: str) -> list[str]:
             if not m:
                 break
             if m.start() > 0:
-                # Case A — marker bị dính giữa dòng: ghi nhận vị trí tách
-                split_points.add(m.start())
+                # Case A — marker giữa dòng: tách trừ khi có từ dẫn trích dẫn trước
+                prefix_s = line[:m.start()].rstrip()
+                if not _CITATION_LEADERS.search(prefix_s):
+                    split_points.add(m.start())
             elif not checked_b:
                 # Case B — marker ở đầu dòng, chỉ kiểm tra lần đầu mỗi pattern
                 trailing = line[m.end():]
@@ -210,6 +229,42 @@ def _build_title_text(line: str, match: re.Match) -> Optional[str]:
     return remainder or None
 
 
+_DIEU_NUM_PRESCAN = re.compile(r"^\s*[Đđ]iều\s+(\d+)")
+_OUTLIER_JUMP = 20   # nhảy ≥ N so với Điều trước → nghi ngờ citation bị tách nhầm
+_OUTLIER_RECOVER = 5  # Điều kế tiếp phải gần với Điều trước ≤ N → xác nhận outlier
+
+
+def _scan_dieu_outliers(lines: list[str]) -> frozenset[int]:
+    """Pre-scan các dòng đã normalize: tìm line index có số Điều nhảy bất thường.
+
+    Pattern bắt được: [..., 3, 4, 47, 5, 6, ...] — 47 nhảy lớn rồi sequence trở về
+    gần giá trị trước → 47 là citation "theo Điều 47" bị tách nhầm thành structural.
+
+    Điều kiện outlier (cả 3 phải đúng):
+      1. curr - prev > _OUTLIER_JUMP   (nhảy lớn)
+      2. nxt < curr                    (sequence trở về)
+      3. nxt - prev <= _OUTLIER_RECOVER (trở về gần prev)
+
+    Không nhầm với reset hợp lệ ở Phụ lục (đã xử lý riêng bởi ghost removal).
+    """
+    hits: list[tuple[int, int]] = []
+    for i, line in enumerate(lines):
+        m = _DIEU_NUM_PRESCAN.match(line)
+        if m:
+            hits.append((i, int(m.group(1))))
+
+    if len(hits) < 3:
+        return frozenset()
+
+    nums = [n for _, n in hits]
+    outliers: set[int] = set()
+    for i in range(1, len(hits) - 1):
+        prev, curr, nxt = nums[i - 1], nums[i], nums[i + 1]
+        if curr - prev > _OUTLIER_JUMP and nxt < curr and nxt - prev <= _OUTLIER_RECOVER:
+            outliers.add(hits[i][0])
+    return frozenset(outliers)
+
+
 def _fallback_whole_document(norm_id: str, markdown: str, now: datetime) -> ParseResult:
     """Văn bản KHÔNG khớp được level pattern nào kể cả sau normalize — vd sắc
     lệnh bổ nhiệm nhân sự ngắn, văn phong cũ, không có cấu trúc Điều/Khoản rõ
@@ -250,9 +305,23 @@ def parse_structure(norm_id: str, markdown: str) -> ParseResult:
     current_leaf_id = "__ROOT__"  # nơi nhận text không khớp level nào
     preamble_lines: list[str] = []  # text trước Component đầu tiên
 
-    for raw_line in markdown.splitlines():
+    all_lines = markdown.splitlines()
+    # Pre-scan: tìm các dòng Điều có số nhảy bất thường (citation bị tách nhầm)
+    skip_indices = _scan_dieu_outliers(all_lines)
+
+    for line_idx, raw_line in enumerate(all_lines):
         line = raw_line.rstrip("\n")
         if not line.strip():
+            continue
+
+        # Điều số outlier → gom vào raw_text của lá hiện tại thay vì tạo Component
+        if line_idx in skip_indices:
+            if current_leaf_id != "__ROOT__":
+                result.raw_text[current_leaf_id] = (
+                    result.raw_text.get(current_leaf_id, "") + line.strip() + "\n"
+                )
+            else:
+                preamble_lines.append(line.strip())
             continue
 
         matched = _match_level(line)

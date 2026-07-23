@@ -82,6 +82,11 @@ def process_relationship_row(
         return
     from_norm_id, to_norm_id, relation_type = resolved
 
+    # Bỏ qua quan hệ tự trỏ (văn bản trích dẫn chính nó) — thừa về logic, gây vòng lặp
+    if from_norm_id == to_norm_id:
+        logger.debug("Bỏ qua quan hệ tự trỏ: norm %s → chính nó (%s)", from_norm_id, relation_type)
+        return
+
     yield NormRelation(from_norm_id=from_norm_id, to_norm_id=to_norm_id, relation_type=relation_type)
 
     if relation_type not in ELIGIBLE_FOR_LAYER_B or get_component_text_map is None:
@@ -140,6 +145,11 @@ async def process_relationship_row_async(
     if resolved is None:
         return results
     from_norm_id, to_norm_id, relation_type = resolved
+
+    # Bỏ qua quan hệ tự trỏ (văn bản trích dẫn chính nó) — thừa về logic, gây vòng lặp
+    if from_norm_id == to_norm_id:
+        logger.debug("Bỏ qua quan hệ tự trỏ: norm %s → chính nó (%s)", from_norm_id, relation_type)
+        return results
 
     # TẦNG A — luôn tạo, không cần LLM
     results.append(NormRelation(from_norm_id=from_norm_id, to_norm_id=to_norm_id, relation_type=relation_type))

@@ -42,6 +42,7 @@ from transform import relation_classifier
 from transform.html_to_markdown import convert as html_to_markdown
 from transform.structure_parser import parse_structure
 from transform.text_accumulator import build_accumulated_text, build_ancestor_chain
+from transform.validate_structure import StructuralWarning, validate_structure
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,26 @@ def _log_issues(norm_id: str, issues: list[StructureIssue]) -> None:
         )
 
 
+def _log_structural_warnings(norm_id: str, warnings: list[StructuralWarning]) -> None:
+    """Log kết quả validate_structure — fix/warn/bug theo mức độ."""
+    if not warnings:
+        return
+    fix_count = sum(1 for w in warnings if w.severity == "fix")
+    warn_count = sum(1 for w in warnings if w.severity == "warn")
+    bug_count = sum(1 for w in warnings if w.severity == "bug")
+    logger.info(
+        "Norm %s — validate_structure: %d fix, %d warn, %d bug",
+        norm_id, fix_count, warn_count, bug_count,
+    )
+    for w in warnings:
+        if w.severity == "bug":
+            logger.error("  [%s/%s] %s", norm_id, w.rule, w.message)
+        elif w.severity == "fix":
+            logger.info("  [%s/%s] %s", norm_id, w.rule, w.message)
+        else:
+            logger.warning("  [%s/%s] %s", norm_id, w.rule, w.message)
+
+
 def _norm_from_metadata_row(row: dict) -> Norm:
     return Norm(
         norm_id=str(row["id"]),
@@ -464,7 +485,16 @@ def _split_textunit(unit_id: str, text: str) -> list[tuple[str, str]]:
             tbl_header_len = len(tbl_header) + 1
 
             if not data_lines:
-                # Empty table after prose conversion (shouldn't happen but be safe)
+                # Không có data rows — tbl_header có thể là prose line dài (vd toàn bộ
+                # document nằm trong 1 table cell). Treat như para để không bị bỏ qua.
+                header_overhead = len(header) + 1 if header else 0
+                line_max = max(500, _MAX_TU_CHARS - header_overhead)
+                for sub_ln in (_split_long_line(tbl_header, line_max) if len(tbl_header) > line_max else [tbl_header]):
+                    sub_len = len(sub_ln) + 1
+                    if current_len + sub_len > _MAX_TU_CHARS and current != ([header] if header else []):
+                        _flush()
+                    current.append(sub_ln)
+                    current_len += sub_len
                 continue
 
             full_table_lines = [tbl_header] + data_lines
@@ -508,9 +538,35 @@ def _split_large_table(
     data_lines: list[str],
     chunks: list[str],
 ) -> None:
-    """Row-split 1 bảng quá lớn, lặp lại ctx_header + tbl_header ở mỗi chunk."""
-    overhead = len(ctx_header) + 1 + len(tbl_header) + 1 if ctx_header else len(tbl_header) + 1
-    current: list[str] = [ctx_header, tbl_header] if ctx_header else [tbl_header]
+    """Row-split 1 bảng quá lớn, lặp lại ctx_header + tbl_header ở mỗi chunk.
+
+    Fallback: nếu tbl_header bản thân đã vượt budget (doc có table header cực dài
+    vd toàn bộ circular title nằm trong header row), treat tbl_header + data như
+    para text, chỉ lặp ctx_header ở đầu mỗi chunk.
+    """
+    ctx_overhead = len(ctx_header) + 1 if ctx_header else 0
+    overhead = ctx_overhead + len(tbl_header) + 1
+
+    if overhead >= _MAX_TU_CHARS:
+        # tbl_header bản thân quá lớn — không dùng làm header lặp lại được.
+        # Treat toàn bộ (tbl_header + data) như para text dưới ctx_header.
+        line_max = max(500, _MAX_TU_CHARS - ctx_overhead)
+        current: list[str] = [ctx_header] if ctx_header else []
+        current_len = ctx_overhead
+        for raw_ln in [tbl_header] + data_lines:
+            for sub_ln in (_split_long_line(raw_ln, line_max) if len(raw_ln) > line_max else [raw_ln]):
+                sub_len = len(sub_ln) + 1
+                if current_len + sub_len > _MAX_TU_CHARS and len(current) > (1 if ctx_header else 0):
+                    chunks.append("\n".join(current))
+                    current = [ctx_header] if ctx_header else []
+                    current_len = ctx_overhead
+                current.append(sub_ln)
+                current_len += sub_len
+        if len(current) > (1 if ctx_header else 0):
+            chunks.append("\n".join(current))
+        return
+
+    current = [ctx_header, tbl_header] if ctx_header else [tbl_header]
     current_len = overhead
 
     row_max = max(500, _MAX_TU_CHARS - overhead)
@@ -549,6 +605,12 @@ def transform_one(metadata_row: dict, content_html: str) -> TransformedDoc:
     # Validate sau dedup — log warning/error nếu vẫn còn bất thường
     issues = validate_parse_result(norm.norm_id, parse_result)
     _log_issues(norm.norm_id, issues)
+
+    # Kiểm tra và sửa cấu trúc (B1-E1): D2 tự sửa, các rule khác chỉ cảnh báo
+    vs_result = validate_structure(norm.norm_id, parse_result.components, parse_result.raw_text)
+    parse_result.components = vs_result.components
+    parse_result.raw_text = vs_result.raw_text
+    _log_structural_warnings(norm.norm_id, vs_result.warnings)
 
     components_by_id = {c.comp_id: c for c in parse_result.components}
     text_units: list[TextUnit] = []
