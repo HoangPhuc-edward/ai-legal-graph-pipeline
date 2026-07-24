@@ -26,7 +26,6 @@ import re
 from schema.edges import NormRelation
 from schema.nodes import Action, Component, Norm, TextUnit
 
-# Nhận diện TextUnit part: "{comp_id}__tu__p{N}" (N >= 2) — sinh từ _split_textunit
 _TU_PART_PAT = re.compile(r"^(.+)__tu__p\d+$")
 
 from .neo4j_client import Neo4jClient

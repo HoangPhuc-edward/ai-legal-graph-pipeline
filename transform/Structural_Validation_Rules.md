@@ -133,7 +133,7 @@ RETURN parent.comp_id, parent.level, child.comp_id, child.level
 | B1, B4, C2 | Under-split (nuốt nội dung) | Rescan raw_text → tạo Component mới |
 | E1 | Bug logic parser | Sửa code, không patch data |
 | C1, C3 | Cấu trúc rỗng bất thường | Rescan hoặc kiểm tra thủ công |
-| D1 | Under-split (nuốt nội dung) | Rescan (warn nếu sau B1/B3/B4/C2 vẫn còn) |
+| D1 | Under-split (nuốt nội dung) | Rescan (warn nếu sau B1/B4/C2 vẫn còn) |
 | D2 | Over-split (trích dẫn bị nhận nhầm) | Gộp ngược vào cha |
 
 **Gợi ý vận hành:** chạy toàn bộ rule này như 1 script `validate_structure.py` sau mỗi lần `--stage transform`, in ra danh sách comp_id vi phạm theo từng rule, kèm mức độ ưu tiên (E1 là bug cần sửa code ngay; còn lại có thể tích lũy rồi xử lý theo batch).

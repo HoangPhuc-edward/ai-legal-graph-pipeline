@@ -3,7 +3,7 @@
 Áp dụng các rule từ Structural_Validation_Rules.md:
 
 Tự sửa (severity="fix"):
-  D2 — Component lá có raw_text < 30 ký tự: gộp nội dung vào node cha,
+  D2 — Component lá có raw_text < 10 ký tự: gộp nội dung vào node cha,
        không tạo TextUnit riêng cho lá này (tránh TextUnit gần rỗng).
   C2 — Điều chỉ có 1 Khoản: rescan raw_text tìm "2. ", "3. " bị nuốt,
        tách ra thành Component mới.
@@ -59,7 +59,7 @@ _VIET_ALPHA_POS = {c: i for i, c in enumerate(_VIET_ALPHA)}
 _GROUP_LEVELS = {ComponentLevel.PHAN, ComponentLevel.CHUONG, ComponentLevel.MUC, ComponentLevel.TIEU_MUC}
 
 # D2: ngưỡng "gần rỗng" (ký tự) — dưới ngưỡng này sẽ gộp vào cha
-_D2_EMPTY_THRESHOLD = 30
+_D2_EMPTY_THRESHOLD = 10
 
 # C1: ngưỡng nội dung tối thiểu để cảnh báo (văn bản cực ngắn thì 1 Điều là bình thường)
 _C1_CONTENT_THRESHOLD = 3_000
@@ -635,7 +635,7 @@ def _check_d1(
     """D1: Dùng median + MAD để phát hiện Component có nội dung dài bất thường.
 
     Chạy sau tất cả rescan — nếu D1 vẫn trigger ở đây thì content thực sự dài,
-    không phải do marker bị nuốt (đã được B1/B3/B4/C2 xử lý trước).
+    không phải do marker bị nuốt (đã được B1/B4/C2 xử lý trước).
     """
     by_level: dict[str, list[tuple[str, int]]] = defaultdict(list)
     comp_map = {c.comp_id: c for c in components}
